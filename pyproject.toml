@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "windprof"
+version = "1.0.0"
+description = "Multi-instrument merged wind and turbulence profile product for WFIP3"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [
+    { name = "Serena Lipari", email = "serena.lipari@pnnl.gov" },
+]
+keywords = ["wind", "lidar", "radar", "VAD", "turbulence", "WFIP3", "offshore", "meteorology"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
+dependencies = [
+    "numpy>=1.22",
+    "pandas>=1.5",
+    "xarray>=2022.11",
+    "scipy>=1.9",
+    "matplotlib>=3.6",
+    "openpyxl>=3.0",
+    "netCDF4>=1.6",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["windprof"]
