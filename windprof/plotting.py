@@ -1,18 +1,9 @@
-"""Diagnostic and summary plotting for WINDPROF output
+"""Diagnostic and summary plotting for WINDPROF output.
 
-Plotting routines used during processing for QA and during analysis for
-campaign summaries:
-
-  - ``plot_combined_profiles``: per-window vertical profile plots showing
-    each contributing instrument plus the merged result.
-  - ``create_daily_hovmoller_plots``: time-height contour plots of wind
-    speed, direction, vertical velocity, and turbulence over one day.
-  - ``create_full_daily_surface_met_plot``: surface met time series.
-
-These routines are intended for sanity-checking processed output and
-generating campaign-summary figures, not for publication-ready plots
-(those live in analysis notebooks). Plotting functions are side-effect-only
-and write to the configured output directory.
+Profile, Hovmoller and surface-met figures for sanity-checking processed
+output and for campaign summaries, not publication-ready plots (those live
+in analysis notebooks). All routines are side-effect-only: they write PNGs
+to the output directory given and return the paths.
 """
 
 import matplotlib.pyplot as plt
@@ -37,8 +28,7 @@ def plot_parameter(ax, param, title, xlabel, merged_profile, individual_profiles
             heights = np.array(sorted_heights)
             values = np.array([profile[h].get(param) for h in sorted_heights])
 
-            # Profile dicts may yield object arrays containing None where a parameter is missing;
-            # coerce to float NaN so downstream masking works.
+            # Profile dicts carry None for a missing parameter, which yields an object array.
             if values.dtype == 'object':
                 values = np.array([np.nan if v is None else v for v in values.flat]).reshape(values.shape)
                 values = values.astype(float)
@@ -52,7 +42,6 @@ def plot_parameter(ax, param, title, xlabel, merged_profile, individual_profiles
                          label=instrument.upper(), s=20)
                 ax.plot(values, heights, color=color, linestyle='--', alpha=0.5)
     
-    # Merged (instrument-averaged) profile, drawn on top in black for emphasis
     sorted_heights = sorted(merged_profile.keys())
     heights = np.array(sorted_heights)
     values = np.array([merged_profile[h].get(param) for h in sorted_heights])
@@ -76,11 +65,7 @@ def plot_parameter(ax, param, title, xlabel, merged_profile, individual_profiles
     ax.legend(fontsize=8)
 
 def plot_availability_panel(ax, interval, colors, markers, availability_threshold):
-    """Plot per-instrument data availability vs. height for one time interval.
-
-    Points below the availability_threshold are drawn with reduced alpha so the user can
-    visually distinguish which instrument/height combinations were retained for the merged profile.
-    """
+    """Plot per-instrument data availability vs. height for one time interval"""
     availability_data = interval.get('availability', {})
     if not availability_data:
         ax.text(0.5, 0.5, 'No availability data',
@@ -127,7 +112,6 @@ def plot_availability_panel(ax, interval, colors, markers, availability_threshol
     # Points meeting the availability threshold get full alpha; others fade to indicate rejection.
     alphas_arr = np.where(meets_arr, 0.7, 0.3)
 
-    # Group by marker so each instrument is drawn in a single scatter call.
     unique_markers = np.unique(markers_arr)
     unique_instruments = np.unique(instruments_arr)
 
@@ -185,8 +169,7 @@ def plot_combined_profiles(combined_results, output_dir, max_plots=None,
 
     print(f"Creating combined plots for {len(intervals_to_plot)} time intervals...")
     
-    # Fixed per-instrument color/marker cycles so the same instrument keeps the same identity
-    # across every figure in a run, making figures comparable side-by-side.
+    # Fixed cycles so an instrument keeps the same color and marker across a run's figures.
     colors = ['green', 'blue', 'red', 'purple', 'orange', 'brown', 'pink', 'gray', 'olive', 'cyan']
     markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', 'h', '*']
     saved_files = []
@@ -204,7 +187,6 @@ def plot_combined_profiles(combined_results, output_dir, max_plots=None,
         
         fig, axes = plt.subplots(1, n_panels, figsize=figsize)
 
-        # Wind plots (first 3 panels)
         plot_parameter(axes[0], 'ws', 'Wind Speed', 'WS (m/s)',
                       wind_data['merged'], wind_data['individual'],
                       wind_data['contributing_instruments'], colors)
@@ -215,7 +197,6 @@ def plot_combined_profiles(combined_results, output_dir, max_plots=None,
                       wind_data['merged'], wind_data['individual'],
                       wind_data['contributing_instruments'], colors)
         
-        # Turbulence plots (next 5 panels)  
         plot_parameter(axes[3], 'ti', 'Turbulence Intensity', 'TI (-)',
                       turb_data['merged'], turb_data['individual'],
                       turb_data['contributing_instruments'], colors)
@@ -235,8 +216,7 @@ def plot_combined_profiles(combined_results, output_dir, max_plots=None,
         if show_availability:
             plot_availability_panel(axes[8], interval, colors, markers, availability_threshold)
 
-        # Share one y-range across all panels so height comparisons are visually consistent.
-        # 10% padding (or 100 m when only one height exists) keeps markers off the axis edges.
+        # Share one y-range across panels so height comparisons are consistent.
         all_heights = set()
         all_heights.update(wind_data['merged'].keys())
         all_heights.update(turb_data['merged'].keys())
@@ -303,26 +283,22 @@ def plot_surface_met_timeseries(surface_met_data, start_time, end_time,
     fig.suptitle(f'Surface Meteorological Conditions - {location_name}\n{date_str} {time_range_str}',
                  fontsize=14, fontweight='bold')
 
-    # Pressure
     axes[0].plot(df.index, df['pressure'], 'b-', linewidth=2, marker='o', markersize=4)
     axes[0].set_ylabel('Pressure\n(hPa)', fontweight='bold')
     axes[0].grid(True, alpha=0.3)
     axes[0].set_title('Surface Air Pressure')
 
-    # Temperature
     axes[1].plot(df.index, df['temperature'], 'r-', linewidth=2, marker='o', markersize=4)
     axes[1].set_ylabel('Temperature\n(°C)', fontweight='bold')
     axes[1].grid(True, alpha=0.3)
     axes[1].set_title('Air Temperature')
 
-    # Relative Humidity
     axes[2].plot(df.index, df['relative_humidity'], 'g-', linewidth=2, marker='o', markersize=4)
     axes[2].set_ylabel('Relative\nHumidity (%)', fontweight='bold')
     axes[2].grid(True, alpha=0.3)
     axes[2].set_title('Relative Humidity')
 
-    # Precipitation bars are narrower (8 min) than the 10-min reporting interval so0o adjacent
-    # bars don't visually touch.
+    # Bars are 8 min wide against the 10 min reporting interval so they don't touch.
     axes[3].bar(df.index, df['precipitation'], width=pd.Timedelta(minutes=8),
                alpha=0.7, color='purple', edgecolor='black', linewidth=0.5)
     axes[3].set_ylabel('Precipitation\n(mm)', fontweight='bold')
@@ -367,8 +343,7 @@ def create_daily_hovmoller_plots(daily_results, output_dir, date_str,
         return None
     print(f"Creating Hovmöller plot for {len(time_intervals)} time intervals")
     
-    # Union of heights across wind and turbulence profiles - the two product groups can
-    # have slightly different height coverage for a given instrument.
+    # Union of heights: wind and turbulence coverage can differ for the same instrument.
     all_heights = set()
     for interval in time_intervals:
         if interval.get('wind_profiles', {}).get('merged'):
@@ -382,7 +357,6 @@ def create_daily_hovmoller_plots(daily_results, output_dir, date_str,
     
     heights = np.array(sorted(all_heights))
 
-    # Full UTC day on the configured averaging grid (TIME_WINDOW_MINUTES from config).
     n_periods = (24 * 60) // TIME_WINDOW_MINUTES
     start_time = pd.to_datetime(f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]} 00:00:00", utc=True)
     time_grid = pd.date_range(start_time, periods=n_periods, freq=f'{TIME_WINDOW_MINUTES}min')
@@ -395,8 +369,7 @@ def create_daily_hovmoller_plots(daily_results, output_dir, date_str,
     w_data = np.full((n_times, n_heights), np.nan)
     ti_data = np.full((n_times, n_heights), np.nan)
     
-    # Flatten nested (interval -> wind/turb -> height) dicts into one record per (time, height)
-    # so wind and turbulence variables share a single row and can't produce duplicate entries.
+    # One record per (time, height) so wind and turbulence variables share a row.
     data_records = []
 
     for interval in time_intervals:
@@ -434,8 +407,7 @@ def create_daily_hovmoller_plots(daily_results, output_dir, date_str,
 
     valid_time_mask = min_time_diffs <= TIME_WINDOW_MINUTES * 60
 
-    # 'searchsorted' returns an insertion index; we need exact matches against our height grid,
-    # so verify that the height at the returned index equals the record's height.
+    # searchsorted returns an insertion index, so confirm the height there really matches.
     height_indices = np.searchsorted(heights, df['height'].values)
     valid_height_mask = ((height_indices < len(heights)) &
                         (heights[height_indices] == df['height'].values))
@@ -451,8 +423,7 @@ def create_daily_hovmoller_plots(daily_results, output_dir, date_str,
         valid_w = df['w'].values[valid_mask]
         valid_ti = df['ti'].values[valid_mask]
 
-        # Scatter-assign per variable, skipping NaNs so pre-initialized NaN matrix entries persist
-        # where a given variable happens to be missing even if other variables exist at that cell.
+        # Assign each variable separately so a cell keeps NaN for the variables it lacks.
         ws_valid_mask = ~np.isnan(valid_ws)
         if np.any(ws_valid_mask):
             ws_data[valid_time_idx[ws_valid_mask], valid_height_idx[ws_valid_mask]] = valid_ws[ws_valid_mask]
@@ -469,10 +440,7 @@ def create_daily_hovmoller_plots(daily_results, output_dir, date_str,
         if np.any(ti_valid_mask):
             ti_data[valid_time_idx[ti_valid_mask], valid_height_idx[ti_valid_mask]] = valid_ti[ti_valid_mask]
     
-    # ------------------------------------------------------------------
-    # Adaptive y-axis: auto-crop to the tallest height that is sampled at
-    # min_timepoints or more intervals, avoiding a mostly-NaN top region.
-    # ------------------------------------------------------------------
+    # Adaptive y-axis: crop to the tallest height sampled at min_timepoints or more intervals.
     print(f"\nCalculating optimal y-axis maximum (min {min_timepoints} timepoints coverage)...")
 
     coverage_counts = []
@@ -500,15 +468,12 @@ def create_daily_hovmoller_plots(daily_results, output_dir, date_str,
         ymax = 1000
         print(f"  -> WARNING: Insufficient data, using fallback ymax = {ymax}m")
 
-    # Coverage fraction reported in the suptitle, restricted to the visible height band.
+    # Suptitle coverage fraction is wind speed only, over the visible height band.
     height_mask = heights <= ymax
     overall_coverage = np.sum(~np.isnan(ws_data[:, height_mask])) / (n_times * np.sum(height_mask)) * 100
     print(f"  -> Overall data coverage in visible range: {overall_coverage:.1f}%")
     
-    # ------------------------------------------------------------------
-    # Adaptive colorbars: percentile-based stretch so a few outliers don't
-    # wash out the colormap. Only the visible (<= ymax) region contributes.
-    # ------------------------------------------------------------------
+    # Percentile colorbar stretch over the visible band so outliers don't wash out the map.
     def get_colorbar_range(data, heights, ymax, percentiles=(2, 98), var_name=''):
         """Return (vmin, vmax) from the 2nd/98th percentile of the visible data."""
         height_mask = heights <= ymax
@@ -531,15 +496,13 @@ def create_daily_hovmoller_plots(daily_results, output_dir, date_str,
     # Wind direction is circular (0-360 deg) - a percentile stretch would be strange.
     wd_vmin, wd_vmax = 0, 360
     w_vmin, w_vmax = get_colorbar_range(w_data, heights, ymax, var_name='W')
-    # Force w colorbar symmetric so the diverging RdBu_r colormap centers on zero (no bias toward
-    # up- or downdraft hues when the data are slightly skewed).
+    # Symmetric range so the diverging RdBu_r colormap centers on zero.
     if w_vmin is not None and w_vmax is not None:
         w_absmax = max(abs(w_vmin), abs(w_vmax))
         w_vmin, w_vmax = -w_absmax, w_absmax
     ti_vmin, ti_vmax = get_colorbar_range(ti_data, heights, ymax, var_name='TI')
 
-    # Fallback ranges chosen to span physically plausible offshore-boundary-layer values
-    # when adaptive ranges can't be computed (e.g. a nearly-empty day).
+    # Fallbacks span plausible offshore boundary-layer values for a nearly empty day.
     if ws_vmin is None: ws_vmin, ws_vmax = 0, 20
     if w_vmin is None: w_vmin, w_vmax = -2, 2
     if ti_vmin is None: ti_vmin, ti_vmax = 0, 0.5
@@ -547,7 +510,6 @@ def create_daily_hovmoller_plots(daily_results, output_dir, date_str,
     fig, axes = plt.subplots(4, 1, figsize=figsize, sharex=True)
     time_mpl = mdates.date2num(time_grid)
 
-    # Wind Speed
     mask1 = ~np.isnan(ws_data.T)
     if np.any(mask1):
         im1 = axes[0].contourf(time_mpl, heights, ws_data.T, levels=20, cmap='viridis',
@@ -559,7 +521,6 @@ def create_daily_hovmoller_plots(daily_results, output_dir, date_str,
     axes[0].set_ylim(0, ymax)
     axes[0].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     
-    # Wind Direction (circular colormap)
     mask2 = ~np.isnan(wd_data.T)
     if np.any(mask2):
         im2 = axes[1].contourf(time_mpl, heights, wd_data.T, levels=20, cmap='hsv',
@@ -571,7 +532,6 @@ def create_daily_hovmoller_plots(daily_results, output_dir, date_str,
     axes[1].set_ylim(0, ymax)
     axes[1].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     
-    # Vertical velocity on a diverging colormap centered on zero.
     mask3 = ~np.isnan(w_data.T)
     if np.any(mask3):
         im3 = axes[2].contourf(time_mpl, heights, w_data.T, levels=20, cmap='RdBu_r',
@@ -583,7 +543,6 @@ def create_daily_hovmoller_plots(daily_results, output_dir, date_str,
     axes[2].set_ylim(0, ymax)
     axes[2].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     
-    # Turbulence Intensity
     mask4 = ~np.isnan(ti_data.T)
     if np.any(mask4):
         im4 = axes[3].contourf(time_mpl, heights, ti_data.T, levels=20, cmap='plasma',
@@ -595,7 +554,6 @@ def create_daily_hovmoller_plots(daily_results, output_dir, date_str,
     axes[3].set_ylim(0, ymax)
     axes[3].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     
-    # 2-hour ticks span a full UTC day without crowding
     axes[3].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
     axes[3].xaxis.set_major_locator(mdates.HourLocator(interval=2))
     axes[3].xaxis.set_minor_locator(mdates.HourLocator())
@@ -664,7 +622,6 @@ def create_daily_surface_met_summary(combined_results, output_dir, date_str):
     axes[2].grid(True, alpha=0.3)
     axes[2].set_title('Relative Humidity')
 
-    # Bar width < reporting interval (10 min) keeps adjacent bars visually separated.
     axes[3].bar(times, precip, width=pd.Timedelta(minutes=8), alpha=0.7, color='purple')
     axes[3].set_ylabel('Precip (mm)')
     axes[3].set_xlabel('Time (UTC)')
@@ -691,10 +648,8 @@ def create_full_daily_surface_met_plot(date_str, base_dir, output_dir,
                                  location='nantucket',
                                  analysis_start_time=None, analysis_end_time=None,
                                  figsize=(15, 12), dpi=300, verbose=False):
-    """Full 24-hour surface-met plot for date_str. 
-    Optionally shades the analysis window if start/end times are provided, 
-    which can be helpful for diagnosing conditions during a specific period 
-    while still showing the full day's context.
+    """Full 24-hour surface-met plot for date_str, shading the analysis window when
+    start/end times are given so a period can be read against the full day.
 
     Parameters
     ----------
@@ -783,7 +738,6 @@ def create_full_daily_surface_met_plot(date_str, base_dir, output_dir,
     axes[2].grid(True, alpha=0.3)
     axes[2].set_title('Relative Humidity')
 
-    # Precipitation as rate bars (left axis) with cumulative line on the twin right axis.
     ax4a = axes[3]
     ax4b = ax4a.twinx()
 
@@ -827,7 +781,6 @@ def create_full_daily_surface_met_plot(date_str, base_dir, output_dir,
     plt.savefig(filepath, dpi=dpi, bbox_inches='tight')
     plt.close()
 
-    # Print basic stats
     if verbose:
         print(f"Daily Surface Met Summary for {date_formatted}:")
         print("-" * 50)
@@ -876,8 +829,7 @@ def create_full_daily_surface_met_plot_from_file(surface_met_file, date_str, out
         time_values = pd.to_datetime(ds.time.values)
         n_times = len(time_values)
 
-        # Surface-met NetCDFs from different sites use inconsistent variable names; fall back through
-        # the common aliases before giving up with all-NaN.
+        # Site surface-met NetCDFs use inconsistent variable names, so fall back through aliases.
         def get_var_values(ds, primary_name, fallback_names=None):
             if fallback_names is None:
                 fallback_names = []
@@ -935,14 +887,12 @@ def create_full_daily_surface_met_plot_from_file(surface_met_file, date_str, out
     ]
     
     for i, (var, style, ylabel, title_text) in enumerate(plot_configs):
-        # Skip plotting if the variable is entirely missing so the panel stays clean instead of empty axes.
         if not df[var].isna().all():
             axes[i].plot(df.index, df[var], style, linewidth=2, marker='o', markersize=3)
         axes[i].set_ylabel(ylabel, fontweight='bold')
         axes[i].grid(True, alpha=0.3)
         axes[i].set_title(title_text)
 
-    # Precipitation gets a dual y-axis (rate bars + cumulative line).
     if not df['precipitation'].isna().all():
         ax4a = axes[3]
         ax4b = ax4a.twinx()
@@ -950,7 +900,6 @@ def create_full_daily_surface_met_plot_from_file(surface_met_file, date_str, out
         bars = ax4a.bar(df.index, df['precipitation'], width=pd.Timedelta(minutes=8),
                        alpha=0.6, color='purple', label='10-min Rate')
 
-        # NaN -> 0 before cumsum so one missing interval doesn't stall the cumulative line.
         precip_cumsum = df['precipitation'].fillna(0).cumsum()
         line = ax4b.plot(df.index, precip_cumsum, 'navy', linewidth=2,
                         marker='o', markersize=2, label='Cumulative')
@@ -980,7 +929,6 @@ def create_full_daily_surface_met_plot_from_file(surface_met_file, date_str, out
         ax.xaxis.set_minor_locator(minor_locator)
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
 
-    # Precip panel formatted separately because of the twin y-axis
     axes[3].xaxis.set_major_formatter(time_formatter)
     axes[3].xaxis.set_major_locator(major_locator)
     axes[3].xaxis.set_minor_locator(minor_locator)

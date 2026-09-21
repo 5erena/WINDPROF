@@ -1,31 +1,26 @@
 """Per-instrument quality control and inter-instrument agreement flags
 
-Two QC layers operate at different stages of processing:
+Two QC layers run at different stages: per-beam QC
+(``filter_data_by_qc_criteria``) before VAD fitting, and inter-instrument
+agreement flags (``calculate_quality_flag_for_height``) during merging.
+Output flags are 0 = good, 1 = suspect, 2 = bad, 3 = no data.
 
-  1. **Per-beam QC** (``filter_data_by_qc_criteria``) is applied before VAD
-     fitting. Each instrument has its own QC signal (CNR, SNR, or
-     intensity) and threshold, set empirically per instrument documentation or 
-     instrument manager recommendation; gates are dropped if fewer than ``min_beams`` beams pass.
-  2. **Inter-instrument agreement flags** (``calculate_quality_flag_for_height``)
-     are applied during merging. Output flags follow the convention
-     0 = good, 1 = suspect, 2 = bad, 3 = no data.
-
-Per-instrument default thresholds (CNR/SNR/intensity, beam minimums) are
-defined inline in the module and named for direct adaptation. 
-Adjust thresholds for new campaigns as needed.
+Per-instrument QC rules (signal type, threshold, beam minimum) live in
+``config.QC_CONFIG`` and are looked up per (site, instrument).
 """
 
 import numpy as np
 
-### Quality Control and Data Validation
+from .config import get_qc_params, MIN_VAD_BEAMS
 
-def filter_data_by_qc_criteria(data, instrument=None, qc_params=None, verbose=True, return_summary=False):
+def filter_data_by_qc_criteria(data, instrument=None, qc_params=None, location=None,
+                               verbose=True, return_summary=False):
     """
     Apply per-beam QC to a single-scan lidar dataset.
 
-    Each instrument has its own QC signal (CNR, SNR, or intensity) and
-    threshold. A height gate is dropped entirely if fewer than ``min_beams`` 
-    beams pass, since downstream VAD fit needs at least 3 valid beams.
+    A height gate is dropped entirely if fewer than ``min_beams`` beams
+    pass: the VAD fit needs at least 4 beams (dof >= 1) for its error
+    bound to be defined.
 
     Parameters
     ----------
@@ -33,9 +28,12 @@ def filter_data_by_qc_criteria(data, instrument=None, qc_params=None, verbose=Tr
         Unfiltered scan data with 'heights', 'time', 'position', and
         per-height 'measurements'.
     instrument : str
-        Instrument key (z01, z02, z03) used to look up default QC params.
+        Instrument key (z01, z02, z03).
     qc_params : dict, optional
-        Override the per-instrument defaults with a custom rule set.
+        QC rule set (a QC_CONFIG entry). Looked up from ``location`` +
+        ``instrument`` when omitted.
+    location : str, optional
+        Site key for the QC_CONFIG lookup when ``qc_params`` is omitted.
     verbose : bool
         Print per-height pass statistics for debugging.
     return_summary : bool
@@ -45,43 +43,28 @@ def filter_data_by_qc_criteria(data, instrument=None, qc_params=None, verbose=Tr
     -------
     dict or None
         Filtered data with the same structure as the input, or None if no
-        heights survived QC.
+        heights survived QC. 'prefiltered' instruments pass through
+        unchanged (QC already applied upstream).
     """
-    # Instrument-specific QC rules. Thresholds were tuned for the WFIP3 campaign 
-    # —> do not use as generic defaults elsewhere.
-    default_qc_params = {
-        'z03': {
-            'qc_type': 'cnr',
-            'threshold': -23,
-            'min_beams': 3,
-            'az_range_threshold': None,
-            'min_height': None
-        },
-        'z02': {
-            'qc_type': 'intensity',
-            'threshold': 1.008,
-            'min_beams': 3,
-            'az_range_threshold': None,
-            'min_height': 100  # drop scanning lidar range gates below 100 m (near-field noise)
-        },
-        'z01': {
-            'qc_type': 'intensity',
-            'threshold': 1.008,
-            'min_beams': 3,
-            'az_range_threshold': None,
-            'min_height': 100  # drop scanning lidar range gates below 100 m (near-field noise)
-        }
-    }
-
     if qc_params is None:
-        qc_params = default_qc_params.get(instrument, {})
-
-    if not qc_params:
-        raise ValueError(f"Unsupported instrument: {instrument}")
+        if location is None:
+            raise ValueError(
+                "filter_data_by_qc_criteria needs qc_params or location+instrument "
+                "to look up QC_CONFIG")
+        qc_params = get_qc_params(location, instrument)
 
     qc_type = qc_params.get('qc_type')
     threshold = qc_params.get('threshold')
-    min_beams = qc_params.get('min_beams', 3)
+    min_beams = qc_params.get('min_beams', MIN_VAD_BEAMS)
+
+    # QC already applied upstream by the instrument: nothing to filter.
+    if qc_type == 'prefiltered':
+        if return_summary:
+            return data, {'total_heights': len(data['measurements']),
+                          'heights_passed': len(data['measurements']),
+                          'pass_percentages': [], 'passed_heights': list(data['measurements']),
+                          'low_pass_heights': []}
+        return data
 
     filtered_data = {
         'heights': data['heights'],
@@ -135,7 +118,6 @@ def filter_data_by_qc_criteria(data, instrument=None, qc_params=None, verbose=Tr
             print(f"    Combined valid: {np.sum(combined_valid)}")
             print(f"    Min beams needed: {min_beams}")
 
-        # Drop the whole height if VAD can't solve with the survivors
         if n_passed < min_beams:
             qc_stats['low_pass_heights'].append((height, pass_percentage))
             continue
@@ -146,8 +128,7 @@ def filter_data_by_qc_criteria(data, instrument=None, qc_params=None, verbose=Tr
 
         filtered_data['measurements'][height] = {}
 
-        # Apply the same mask to every variable at this height so all
-        # arrays stay aligned for the downstream solve.
+        # Mask every variable at this height so the per-beam arrays stay aligned.
         for key, values in data['measurements'][height].items():
             filtered_values = values[qc_mask]
             filtered_data['measurements'][height][key] = filtered_values
@@ -180,11 +161,15 @@ def filter_data_by_qc_criteria(data, instrument=None, qc_params=None, verbose=Tr
         return filtered_data, qc_stats
     return filtered_data
 
-def calculate_data_availability(qc_filtered_data, original_data, availability_threshold=0.5):
+def calculate_data_availability(qc_filtered_data, original_data, availability_threshold=0.5,
+                                qc_type=None, threshold=None):
     """
     Per-height data availability as the fraction of raw beams that would
-    pass QC, computed against the unfiltered input. i.e. "what fraction of 
-    what the instrument recorded was usable".
+    pass QC, computed against the unfiltered input: "what fraction of what
+    the instrument recorded was usable".
+
+    ``qc_type`` and ``threshold`` must be the QC_CONFIG values the beam
+    filter used; inferring them here would let the two silently disagree.
 
     Parameters
     ----------
@@ -194,12 +179,21 @@ def calculate_data_availability(qc_filtered_data, original_data, availability_th
         Unfiltered data used for the availability calculation.
     availability_threshold : float
         Per-height availability at or above this value counts as "meets_threshold".
+    qc_type : str
+        QC signal name ('intensity', 'cnr', 'snr') from QC_CONFIG.
+    threshold : float
+        The matching QC_CONFIG threshold.
 
     Returns
     -------
     dict
         'total_availability', per-height breakdown, and a boolean 'meets_threshold'.
     """
+    if qc_type is None or threshold is None:
+        raise ValueError(
+            "calculate_data_availability requires the QC_CONFIG qc_type and "
+            "threshold so availability uses the same rule as the beam filter")
+
     availability = {
         'total_availability': 0,
         'height_availability': {},
@@ -207,26 +201,13 @@ def calculate_data_availability(qc_filtered_data, original_data, availability_th
     }
     for height in qc_filtered_data['measurements'].keys():
         if height in original_data['measurements']:
-            # Auto-detect QC signal since this function is called on data
-            # from any of the three lidars without knowing which upstream.
-            qc_values = None
-            qc_threshold = None
-            if 'snr' in original_data['measurements'][height] or 'SNR' in original_data['measurements'][height]:
-                qc_values = original_data['measurements'][height].get('snr',
-                           original_data['measurements'][height].get('SNR'))
-                qc_threshold = -23
-            elif 'intensity' in original_data['measurements'][height]:
-                qc_values = original_data['measurements'][height]['intensity']
-                qc_threshold = 1.008
-            elif 'cnr' in original_data['measurements'][height]:
-                qc_values = original_data['measurements'][height]['cnr']
-                qc_threshold = -23
-
+            fields = original_data['measurements'][height]
+            qc_values = fields.get(qc_type, fields.get(qc_type.upper()))
             if qc_values is None:
                 continue
 
             total_measurements = len(qc_values)
-            valid_measurements = np.sum(qc_values >= qc_threshold)
+            valid_measurements = np.sum(qc_values >= threshold)
             availability_percentage = valid_measurements / total_measurements if total_measurements > 0 else 0
 
             availability['height_availability'][height] = {
@@ -248,7 +229,7 @@ def calculate_data_availability(qc_filtered_data, original_data, availability_th
 def summarize_vad_fit_failures(qc_failure_reasons):
     """
     Aggregate per-scan VAD fit failures into a single summary dict for
-    post-campaign diagnostics — counts per failure mode, affected height
+    post-campaign diagnostics: counts per failure mode, affected height
     ranges, and the raw details from each rejected fit.
     """
     if not qc_failure_reasons or 'chi_square_fit' not in qc_failure_reasons or not qc_failure_reasons['chi_square_fit']:
@@ -285,8 +266,6 @@ def summarize_vad_fit_failures(qc_failure_reasons):
     summary['height_ranges']['overall'] = tuple(summary['height_ranges']['overall'])
 
     return summary
-
-#### Quality Flag Assignment
 
 def calculate_wind_direction_flag(wind_directions, sigma_threshold=2.0):
     """
@@ -328,12 +307,10 @@ def calculate_wind_direction_flag(wind_directions, sigma_threshold=2.0):
 
 def check_excessive_turbulence_flag(interpolated_data, height):
     """
-    Flag σ_u/|ū| > 1 at a given height as 'bad' (flag=2).
-
-    This ratio captures "velocity fluctuations larger than the mean flow",
-    which is physically implausible for sustained horizontal wind — usually
-    indicates a broken retrieval rather than real turbulence. We skip the
-    check when |ū| < 0.1 m/s since the ratio blows up for calm conditions.
+    Flag σ_u/|ū| > 1 at a given height as 'bad' (flag=2): fluctuations
+    larger than the mean flow are implausible for sustained horizontal
+    wind and usually mean a broken retrieval. Skipped when |ū| < 0.1 m/s,
+    where the ratio blows up.
     """
     u_components = []
     std_u_values = []
@@ -380,8 +357,7 @@ def check_extreme_vertical_velocity_flag(interpolated_data, height):
 def calculate_circular_spread(wind_directions):
     """
     Maximum pairwise circular distance among a list of wind directions,
-    in degrees on [0, 180]. O(N²) where N is the number of instruments at
-    one height (typically 2–4), so it stays cheap.
+    in degrees on [0, 180].
     """
     if len(wind_directions) < 2:
         return 0.0
@@ -397,20 +373,13 @@ def calculate_circular_spread(wind_directions):
 
     return np.rad2deg(max_spread)
 
-def check_inter_instrument_agreement(instruments_data, height, param_name, sigma_threshold=None):
+def check_inter_instrument_agreement(instruments_data, height, param_name):
     """
-    Flag a height as 'suspect' when independent instruments disagree
-    on wind speed, direction, or vertical velocity beyond a tolerance. 
-    Turbulence parameters are not checked here — their valid
-    across-instrument spread is much larger and is handled separately.
-
-    Thresholds:
-        wd: > 30° circular spread
-        w:  > 2 m/s range
-        ws: > max(1.5 m/s, 0.5 x median ws) — scale with ambient flow
-
-    The ``sigma_threshold`` argument is retained for backward compatibility
-    with residual older callers but is no longer used.
+    Flag a height as 'suspect' when independent instruments disagree on
+    wind speed, direction, or vertical velocity beyond a tolerance; the
+    wind-speed tolerance scales with the ambient flow. Turbulence
+    parameters are excluded, their across-instrument spread is
+    legitimately much larger.
     """
     if param_name not in ['ws', 'wd', 'w']:
         return 0
@@ -445,14 +414,14 @@ def calculate_quality_flag_for_height(height, interpolated_data, parameters):
     """
     Assemble per-parameter quality flags for one height level by running
     each parameter through the applicable checks (inter-instrument
-    agreement + parameter-specific sanity checks). Returns 3 (missing)
-    when the height is absent from every instrument's profile.
+    agreement plus parameter-specific sanity checks).
 
     Parameters
     ----------
     height : float
     interpolated_data : dict
-        {instrument: {height: {param: value}}}
+        {instrument: {height: {param: value}}}, restricted by the caller to
+        the instruments that contributed to the merged value at this height.
     parameters : list
         Parameter names to evaluate.
 
@@ -488,7 +457,6 @@ def calculate_quality_flag_for_height(height, interpolated_data, parameters):
             if extreme_w_flag == 1:
                 flag = max(flag, 1)
 
-        # σ_u/|ū| is a wind-speed-only check; wind direction has its own inter-instrument logic
         if param == 'ws':
             sigma_u_flag = check_excessive_turbulence_flag(interpolated_data, height)
             if sigma_u_flag == 2:

@@ -1,24 +1,13 @@
-"""VAD wind retrieval, turbulence estimation, and uncertainty propagation
+"""VAD wind retrieval, turbulence estimation, and uncertainty propagation.
 
-Provides the geometry-agnostic computational core used by both scanning
-and profiling lidar processing:
-
-  - ``fit_chi_winds``: chi-square least-squares fit of (u, v, w) to a single
-    conical scan, with covariance-based component uncertainties.
-  - ``calculate_turbulence_metrics``: Reynolds decomposition, hybrid
-    wind-speed averaging (Rosenbusch 2021), TKE and turbulence intensity.
-  - ``apply_physics_based_qc``: physics-bound rejection of unphysical
-    turbulence retrievals (TKE, TI).
-
-Inputs are arrays of (azimuth, elevation, radial velocity) for one scan
-or one 10-minute window; instrument-specific ingestion happens upstream
-in ``lidars.py``, ``radars.py``, and ``anemometers.py``.
+Geometry-agnostic computational core shared by scanning and profiling lidar
+processing. Inputs are arrays of (azimuth, elevation, radial velocity) for one
+scan or one 10-minute window; instrument-specific ingestion happens upstream in
+``lidars.py``, ``radars.py``, and ``anemometers.py``.
 """
 
 import numpy as np
 from numpy.linalg import pinv, norm
-
-### Wind Analysis (VAD Fitting)
 
 def fit_chi_winds(az, el, rv, wind_speed_error=2, min_ws_for_direction=2.0):
     """
@@ -53,23 +42,19 @@ def fit_chi_winds(az, el, rv, wind_speed_error=2, min_ws_for_direction=2.0):
         chi-square residual, R², condition number, and a diagnostics sub-dict
         explaining any rejection.
     """
-    # Diagnostics accumulate at each failure path so callers can attribute
-    # rejections to specific causes during post-campaign analysis.
     diagnostics = {
         'status': 'success',
         'failure_reason': None,
         'min_ws_threshold': min_ws_for_direction
     }
 
-    # Drop beams with NaN radial velocity (failed instrument-level QC
-    # upstream — low SNR/intensity) before the solve.
+    # NaN radial velocity means the beam failed instrument-level QC upstream
+    # (low SNR or intensity).
     mask = ~np.isnan(rv)
     az = np.array(az)[mask]
     el = np.array(el)[mask]
     rv = np.array(rv)[mask]
 
-    # Need >= 3 valid beams to solve for (u, v, w) — system is
-    # under-determined otherwise.
     if len(rv) < 3:
         diagnostics.update({
             'status': 'failed',
@@ -78,8 +63,6 @@ def fit_chi_winds(az, el, rv, wind_speed_error=2, min_ws_for_direction=2.0):
         })
         return {**_return_nans(), 'diagnostics': diagnostics}
 
-    # Direction cosines project each beam onto (u, v, w) axes via 
-    # VAD equation above.
     az_rad = np.deg2rad(az)
     el_rad = np.deg2rad(el)
     cos_el = np.cos(el_rad)
@@ -87,16 +70,13 @@ def fit_chi_winds(az, el, rv, wind_speed_error=2, min_ws_for_direction=2.0):
     x2 = np.cos(az_rad) * cos_el
     x3 = np.sin(el_rad)
 
-    # Normal equations for the least-squares system X · [u, v, w]^T ≈ rv.
     X = np.column_stack([x1, x2, x3])
     a = X.T @ X
     b = X.T @ rv
 
-    # Flag ill-posed scan geometries via the condition number of the normal
-    # matrix (e.g., azimuthal sampling too narrow to separate u from v, or
-    # a near-vertical stare that collapses the horizontal basis). 
-    # CN >= 1000: practical threshold for ill-conditioning. Higher values
-    # indicate noise amplification may degrade the solution.
+    # Condition number of the normal matrix flags ill-posed geometry, e.g.
+    # azimuthal sampling too narrow to separate u from v. CN >= 1000 is the
+    # practical cutoff.
     ainv = pinv(a)
     CN = norm(a) * norm(ainv)
 
@@ -108,24 +88,27 @@ def fit_chi_winds(az, el, rv, wind_speed_error=2, min_ws_for_direction=2.0):
         })
         return {**_return_nans(), 'diagnostics': diagnostics}
 
-    # Solve for wind components
     c = ainv @ b
     u, v, w = c
 
     rv_fit = X @ c
 
-    # Chi-square captures systematic residuals between observed and fitted
-    # radial velocities; it feeds into the component error calculation below
-    # via the reduced chi-square s² = χ²/dof.
     chisq = np.sum((rv_fit - rv)**2)
     residual = np.sqrt(chisq/len(rv))
 
     r2 = _calculate_r2(rv, rv_fit)
 
-    # Three free parameters (u, v, w), so dof = N_beams - 3
+    # An exactly determined N=3 fit has zero residual by construction, so
+    # sigma_ws is 0/0 and the wserr gate cannot fire: at least 4 beams are
+    # required (min_beams upstream).
     dof = len(rv) - 3
     if dof <= 0:
-        return _return_nans()
+        diagnostics.update({
+            'status': 'failed',
+            'failure_reason': 'insufficient_dof',
+            'data_points': len(rv)
+        })
+        return {**_return_nans(), 'diagnostics': diagnostics}
 
     # Component standard errors from the least-squares covariance matrix
     # (X^T X)^-1, scaled by the reduced chi-square.
@@ -155,12 +138,8 @@ def fit_chi_winds(az, el, rv, wind_speed_error=2, min_ws_for_direction=2.0):
         else:
             wd = np.nan
 
-    # Wind speed error propagated from component errors
     wserr = np.sqrt((u*uerr)**2 + (v*verr)**2)/ws if ws > 0 else np.nan
 
-    # Wind direction error has a WS^-2 dependence (see docstring). Below
-    # min_ws_for_direction we return NaN; above we still cap at the
-    # physical maximum of 180° to handle numerical edge cases.
     if ws < min_ws_for_direction:
         wderr = np.nan
         diagnostics['low_wind_speed_flag'] = True
@@ -168,6 +147,7 @@ def fit_chi_winds(az, el, rv, wind_speed_error=2, min_ws_for_direction=2.0):
         diagnostics['wd_error_reason'] = f'wind_speed_below_{min_ws_for_direction}_ms'
     elif ws > 0:
         wderr_raw = (180/np.pi) * np.sqrt((u*verr)**2 + (v*uerr)**2)/(ws**2)
+        # Cap at 180 degrees, the physical maximum for a direction error.
         wderr = min(wderr_raw, 180.0)
 
         if wderr_raw > 180.0:
@@ -176,8 +156,6 @@ def fit_chi_winds(az, el, rv, wind_speed_error=2, min_ws_for_direction=2.0):
     else:
         wderr = np.nan
 
-    # Reject the entire fit if the component-propagated wind speed error exceeds
-    # ceiling — fit is technically valid but too noisy for downstream use.
     if wserr > wind_speed_error:
         diagnostics.update({
             'status': 'failed',
@@ -198,9 +176,7 @@ def fit_chi_winds(az, el, rv, wind_speed_error=2, min_ws_for_direction=2.0):
     }
 
 def _return_nans():
-    """Return a dict of NaN values with the same shape as a successful fit.
-    Used by every failure path in fit_chi_winds so callers can rely on
-    consistent output keys regardless of whether the fit succeeded."""
+    """NaN dict with the same keys as a successful fit, used by every failure path."""
     return {
         'u': np.nan, 'v': np.nan, 'w': np.nan,
         'uerr': np.nan, 'verr': np.nan, 'werr': np.nan,
@@ -217,8 +193,7 @@ def _return_nans():
 def _calculate_r2(measured, predicted):
     """
     Coefficient of determination (R²) between measured and predicted arrays.
-    Clamped to [0, 1] to match the MATLAB reference implementation — negative
-    R² can arise from poor fits but isn't meaningful as a fit-quality metric.
+    Clamped to [0, 1] to match the MATLAB reference implementation.
     """
     valid = ~(np.isnan(measured) | np.isnan(predicted))
     measured = measured[valid]
@@ -266,9 +241,8 @@ def apply_physics_based_qc(turbulence_data):
     if turbulence_data.get('ti', 0) > 3.0:
         return True
 
-    # Multi-parameter consistency check — catches artifacts where a
-    # moderate TKE is paired with a single blown-up component std, typically
-    # from a lone outlier scan dominating the variance within a 10-min window.
+    # Catches a moderate TKE paired with a single blown-up component standard
+    # deviation.
     if (turbulence_data.get('tke', 0) > 15.0 and
         any(turbulence_data.get(f'std_{comp}', 0) > 10.0 for comp in ['u', 'v', 'w'])):
         return True
@@ -309,13 +283,11 @@ def calculate_turbulence_metrics(u_series, v_series, w_series, ws_series, hybrid
     w_series = np.array(w_series) if w_series is not None else None
     ws_series = np.array(ws_series)
 
-    # Need at least 3 scans to compute a meaningful variance
     if len(u_series) < 3:
         return None
 
-    # Unified validity mask across all series — dropping a scan from one
-    # variable means dropping it from all, so Reynolds decomposition
-    # operates on a consistent sample set.
+    # One mask for all series: a scan dropped from one variable is dropped from
+    # all, so the Reynolds decomposition uses a consistent sample set.
     valid_mask = ~np.isnan(u_series) & ~np.isnan(v_series) & ~np.isnan(ws_series)
     if w_series is not None:
         valid_mask = valid_mask & ~np.isnan(w_series)
@@ -341,8 +313,8 @@ def calculate_turbulence_metrics(u_series, v_series, w_series, ws_series, hybrid
         raise ValueError("Method must be 'empirical' or 'theoretical'")
 
     # === Turbulence Intensity ===
-    # TI is undefined as WS -> 0 (division by zero). 0.1 m/s floor
-    # protects the calculation without affecting any realistic flow.
+    # 0.1 m/s floor: TI is undefined as WS approaches 0, and no realistic flow
+    # is below it.
     if hybrid_ws < 0.1:
         ti = np.nan
     else:
@@ -350,10 +322,8 @@ def calculate_turbulence_metrics(u_series, v_series, w_series, ws_series, hybrid
         ti = std_ws / hybrid_ws
 
     # === Component Standard Deviations ===
-    # Note: these are computed in the instrument-fixed frame (east-north-up),
-    # not rotated to streamwise/cross-stream. TKE and TI are rotationally
-    # invariant, but individual σ_u / σ_v are not — users comparing components
-    # across instruments with different orientations should account for this.
+    # Instrument-fixed frame (east, north, up), not rotated to streamwise: TKE
+    # and TI are rotationally invariant, std_u and std_v individually are not.
     std_u = np.std(u_valid)
     std_v = np.std(v_valid)
 
@@ -368,11 +338,8 @@ def calculate_turbulence_metrics(u_series, v_series, w_series, ws_series, hybrid
         w_mean = np.mean(w_valid)
         w_prime = w_valid - w_mean
         std_w = np.std(w_valid)
-        # TKE = 1/2 * (σ_u² + σ_v² + σ_w²)
         tke = 0.5 * (np.mean(u_prime_sq) + np.mean(v_prime_sq) + np.mean(w_prime**2))
     else:
-        # Without vertical velocity (some anemometer configs) we can't
-        # compute the full 3D TKE. Return NaN rather than a 2D approximation.
         std_w = np.nan
         tke = np.nan
 

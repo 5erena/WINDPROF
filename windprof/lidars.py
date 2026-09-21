@@ -29,12 +29,22 @@ import xarray as xr
 import os
 from .config import (get_wind_correction, get_w_sign_correction,
                     get_ground_elevation_from_config, get_instrument_coordinates,
-                    round_profile_values, TIME_WINDOW_MINUTES)
+                    round_profile_values, wind_direction_average, TIME_WINDOW_MINUTES,
+                    get_qc_params, MIN_VAD_BEAMS)
 from .wind_analysis import fit_chi_winds, calculate_turbulence_metrics, apply_physics_based_qc
 from .quality_control import filter_data_by_qc_criteria, calculate_data_availability
 from .lidar_parsers import parse_profiling_lidar_file, parse_profiling_csv_file, parse_caco_lidar_file
 
-### Scan Segment Functions 
+# All WFIP3 scanning lidars run their VAD as a 6-position cone at 60° elevation.
+# Only beams in this band enter the retrieval: composite scans (NANT z01) also hold
+# 90° vertical stares and ~0.5-5° sector sweeps, whose horizontal leverage and
+# sampled altitude do not match the height they would be keyed to. They are excluded
+# from fitting, beam counting, QC/availability and turbulence segmentation, so
+# min_beams counts only fit-entering VAD beams.
+VAD_ELEVATION_DEG = 60.0
+VAD_ELEVATION_TOL_DEG = 2.0
+
+### Scan Segment Functions
 
 def identify_scanning_lidar_segments(timestamps, az_angles, instrument='z01', min_points=3, debug=False, agl_height=None, reset_threshold=-200):
     """
@@ -60,22 +70,12 @@ def identify_scanning_lidar_segments(timestamps, az_angles, instrument='z01', mi
     --------
     list
         List of segment indices for each scan
-    Notes:
-    ------
-    - All scanning lidars in WFIP3 use a 6-beam VAD pattern at 60° elevation
-      (azimuths 0/360°, 60°, 120°, 180°, 240°, 300°). NANT z01 additionally
-      includes a vertical (90° elevation) stare every 7 beams.
-    - Resets are detected as large negative azimuth differences (300° -> 0°
-      gives ~ -300°). The ``reset_threshold`` defaults to -200; NANT z01 uses
-      -50 as a more permissive threshold (the scan still wraps from 300°,
-      but the value is set conservatively).
     """
     if len(az_angles) < min_points:
         if debug and agl_height is not None:
             print(f"  Height {agl_height:.1f}m: Not enough points ({len(az_angles)})")
         return []
 
-    # Find where azimuth resets from larger angles back to smaller angles
     az_diffs = np.diff(az_angles)
     # Look for large negative differences (e.g., 300°/360° -> 0°/60° for VAD,
     # or ~164° -> 86° for PPI sector scans with reset_threshold=-50)
@@ -84,7 +84,6 @@ def identify_scanning_lidar_segments(timestamps, az_angles, instrument='z01', mi
     if len(reset_indices) < 2:
         if debug and agl_height is not None:
             print(f"  Height {agl_height:.1f}m: No clear scan pattern transitions found")
-        # Look for points where azimuth is close to 0° (or 360° for z02)
         if instrument.lower() == 'z02':
             az_close_to_zero = np.where((az_angles < 10) | (az_angles > 350))[0]
         else:  # z01
@@ -93,7 +92,6 @@ def identify_scanning_lidar_segments(timestamps, az_angles, instrument='z01', mi
         if len(az_close_to_zero) < 2:
             if debug and agl_height is not None:
                 print(f"  Height {agl_height:.1f}m: Unable to identify scans using azimuth values")
-            # Fall back to time-based segmentation
             point_count = len(az_angles)
             points_per_scan = 6  # Both instruments have 6 beam positions per scan
             num_scans = point_count // points_per_scan
@@ -108,7 +106,6 @@ def identify_scanning_lidar_segments(timestamps, az_angles, instrument='z01', mi
                 print(f"  Height {agl_height:.1f}m: Created {len(segments)} segments based on {instrument.upper()} scan pattern")
             return segments
         
-        # Use points where azimuth is close to 0°/360° as scan boundaries
         segments = []
         for i in range(len(az_close_to_zero) - 1):
             start_idx = az_close_to_zero[i]
@@ -129,10 +126,8 @@ def identify_scanning_lidar_segments(timestamps, az_angles, instrument='z01', mi
             print(f"  Height {agl_height:.1f}m: Created {len(segments)} segments using {zero_marker} azimuth markers")
         return segments
     
-    # Use identified reset points to create segments
     segments = []
     
-    # Process segments with handling for repeated measurements (z01 specific)
     def process_segment(start_idx, end_idx):
         if instrument.lower() == 'z01':
             segment_az = az_angles[start_idx:end_idx]
@@ -146,12 +141,10 @@ def identify_scanning_lidar_segments(timestamps, az_angles, instrument='z01', mi
                 return list(range(start_idx, end_idx))
             return None
     
-    # First segment
     first_segment = process_segment(0, reset_indices[0] + 1)
     if first_segment:
         segments.append(first_segment)
     
-    # Middle segments
     for i in range(len(reset_indices) - 1):
         start_idx = reset_indices[i] + 1
         end_idx = reset_indices[i+1] + 1
@@ -159,7 +152,6 @@ def identify_scanning_lidar_segments(timestamps, az_angles, instrument='z01', mi
         if segment:
             segments.append(segment)
     
-    # Last segment
     last_segment = process_segment(reset_indices[-1] + 1, len(az_angles))
     if last_segment:
         segments.append(last_segment)
@@ -188,7 +180,6 @@ def identify_profiling_lidar_segments(az_angles, min_points=3, debug=False, agl_
             print(f"  Height {agl_height:.1f}m: Not enough points ({len(az_angles)})")
         return []
     
-    # Convert to float array if not already
     try:
         az_angles = np.array(az_angles, dtype=float)
     except (ValueError, TypeError):
@@ -203,7 +194,6 @@ def identify_profiling_lidar_segments(az_angles, min_points=3, debug=False, agl_
     if len(reset_indices) < 2:
         if debug:
             print(f"  Height {agl_height:.1f}m: No clear azimuth pattern resets found")
-        # Alternative: divide into equal segments based on expected pattern
         points_per_scan = 4  # Typical profiling lidar has 4 beam directions per scan
         num_scans = len(az_angles) // points_per_scan
         
@@ -221,21 +211,17 @@ def identify_profiling_lidar_segments(az_angles, min_points=3, debug=False, agl_
             print(f"  Height {agl_height:.1f}m: Created {len(segments)} segments based on expected pattern")
         return segments
     
-    # Use reset indices to create segments
     segments = []
     
-    # First segment (if enough points)
     if reset_indices[0] + 1 >= min_points:
         segments.append(list(range(0, reset_indices[0] + 1)))
     
-    # Middle segments
     for i in range(len(reset_indices) - 1):
         start_idx = reset_indices[i] + 1
         end_idx = reset_indices[i+1] + 1
         if end_idx - start_idx >= min_points:
             segments.append(list(range(start_idx, end_idx)))
     
-    # Last segment (if enough points)
     if len(az_angles) - (reset_indices[-1] + 1) >= min_points:
         segments.append(list(range(reset_indices[-1] + 1, len(az_angles))))
     
@@ -278,11 +264,9 @@ def extract_profiling_lidar_height_measurements(filtered_results, height, time_m
         position = filtered_results['position'].iloc[idx]
         vr_value = filtered_results['measurements'][height]['vr'].iloc[idx]
         
-        # Skip NaN values and vertical beams
         if np.isnan(vr_value) or position == 'V':
             continue
         
-        # Convert position to float
         try:
             az_angle = float(position)
         except (ValueError, TypeError):
@@ -304,13 +288,11 @@ def extract_qc_valid_measurements(qc_data, vr_data, az_data, el_data,
                                         times, threshold, min_beams):
     """Extract valid measurements for turbulence processing"""
    
-    # Single vectorized mask
     valid_mask = (qc_data >= threshold) & ~np.isnan(vr_data)
     
     if np.sum(valid_mask) < min_beams:
         return None, None, None, None
     
-    # Apply mask to all arrays at once
     return (np.array(times)[valid_mask], az_data[valid_mask],
             el_data[valid_mask], vr_data[valid_mask])
 
@@ -322,13 +304,11 @@ def identify_complete_scans(timestamps, az_angles, el_angles, radial_vel, instru
     if len(az_angles) < min_beams_per_scan:
         return []
     
-    # Use existing segmentation logic to find scan boundaries
     if instrument.lower() in ['z01', 'z02']:
         segments = identify_scanning_lidar_segments(timestamps, az_angles, instrument, min_beams_per_scan)
     else:
         segments = identify_profiling_lidar_segments(az_angles, min_beams_per_scan)
     
-    # Convert segments into complete scan data structures
     complete_scans = []
     for segment in segments:
         if len(segment) >= min_beams_per_scan:
@@ -349,20 +329,17 @@ def process_turbulence_from_scans(timestamps, az_angles, el_angles, radial_vel,
     """
     Extract turbulence by analyzing multiple complete scans over time
     """
-    # Identify complete scans
     complete_scans = identify_complete_scans(timestamps, az_angles, el_angles, radial_vel, 
                                            instrument, min_beams_per_scan)
     
     if len(complete_scans) < min_scans:
         return None
         
-    # Fit VAD to each complete scan to get wind components  
     scan_results = []
     for scan in complete_scans:
         try:
             wind_result = fit_chi_winds(scan['az'], scan['el'], scan['vr'])
             if not np.isnan(wind_result['ws']):
-                # Apply corrections 
                 corrected_wd = (wind_result['wd'] + wind_dir_correction) % 360
                 corrected_w = wind_result['w'] * w_sign_correction
                 
@@ -376,29 +353,25 @@ def process_turbulence_from_scans(timestamps, az_angles, el_angles, radial_vel,
         except Exception:
             continue
     
-    # Check if we have enough successful fits
     if len(scan_results) < min_scans:
         return None
         
-    # Create time series from scan results
     u_series = np.array([r['u'] for r in scan_results])
     v_series = np.array([r['v'] for r in scan_results]) 
     w_series = np.array([r['w'] for r in scan_results])
     ws_series = np.array([r['ws'] for r in scan_results])
     
-    # Use existing turbulence calculation function 
     return calculate_turbulence_metrics(u_series, v_series, w_series, ws_series, 'empirical')
 
 ### Instrument Processors
 
 def process_scanning_lidar(ds, start_time, instrument_code, location, time_window=TIME_WINDOW_MINUTES,
-                          qc_threshold=None, min_beams=3, wind_dir_correction=None,
-                          min_beams_per_scan=3, az_range_threshold=60, 
+                          min_beams=None, wind_dir_correction=None,
+                          min_beams_per_scan=3,
                           availability_threshold=0.5, ground_elevation=None,
                           verbose=False):
     """
     Process scanning lidar data for combined wind and turbulence profiles
-    Now supports location-specific configurations for different site deployments
     Parameters:
     -----------
     ds : xarray.Dataset
@@ -407,8 +380,6 @@ def process_scanning_lidar(ds, start_time, instrument_code, location, time_windo
         'z01' or 'z02' to specify instrument-specific processing
     location : str
         Location identifier ('nantucket', 'rhode_island', 'cape_cod', or 'block_island')
-    qc_threshold : float, optional
-        Quality control threshold. If None, uses location+instrument defaults
     start_time : datetime
         Start time for processing window
     time_window : int, optional
@@ -416,15 +387,15 @@ def process_scanning_lidar(ds, start_time, instrument_code, location, time_windo
     wind_dir_correction : float, optional
         Wind direction correction. If None, uses location defaults
     min_beams : int, optional
-        Minimum number of valid beams required for VAD fitting (default: 3)
+        Minimum number of fit-entering VAD beams. Defaults to the
+        QC_CONFIG value (4): a 3-beam fit is exactly determined, so its
+        wind-speed error is undefined and the wserr gate cannot apply
     min_beams_per_scan : int, optional
         Minimum beams required per scan segment for turbulence analysis (default: 3)
-    az_range_threshold : float, optional
-        Minimum azimuth range in degrees for valid scans (default: 60)
     availability_threshold : float, optional
         Minimum data availability fraction (0-1) for height inclusion (default: 0.5)
     ground_elevation : float, optional
-        Ground elevation in meters. If None, retrieved from USGS service
+        Ignored: the value is read from the site config.
     verbose : bool, optional
         Enable detailed processing output (default: False)
     Returns:
@@ -432,14 +403,12 @@ def process_scanning_lidar(ds, start_time, instrument_code, location, time_windo
     dict or None
         Dictionary containing wind and turbulence profiles or None if insufficient data
     """
-    # Extract coordinates from dataset
     try:
         latitude = float(ds.lat[0].values)
         longitude = float(ds.lon[0].values)
     except Exception as e:
         if verbose:
             print(f"Warning: Could not extract coordinates from {instrument_code} dataset: {e}, using fallback")
-        # Fallback to location-based coordinates
         fallback_coords = get_instrument_coordinates(location, f'{instrument_code}_lidar')
         if fallback_coords:
             latitude, longitude = fallback_coords[0], fallback_coords[1]
@@ -447,74 +416,59 @@ def process_scanning_lidar(ds, start_time, instrument_code, location, time_windo
             print(f"Error: No coordinates found for {instrument_code} at {location}")
             return None
     
-    # Per-(site, instrument) scanning lidar configuration. Static fields could
-    # live in config.py, but ``segment_func`` is a closure over a function in
-    # this module — moving it there would create a circular import. Corrections
-    # (wind, w-sign) are read from config.py via the lookup helpers.
-    #
-    # Fields:
-    #   qc_metric         : QC signal name ('intensity', 'snr', 'cnr')
-    #   qc_threshold      : numeric threshold; values below are dropped
-    #   wind_dir_correction : azimuth offset in degrees (true-north reference)
-    #   w_sign_correction : ±1 multiplier on raw vertical velocity
-    #   segment_func      : callable that splits the time series into scans
+    # Per-(site, instrument) scanning lidar configuration. ``segment_func`` closes
+    # over a function in this module, so this dict cannot live in config.py without
+    # a circular import. Fields: wind_dir_correction (azimuth offset in degrees,
+    # true-north reference), w_sign_correction (+-1 on raw vertical velocity),
+    # segment_func (callable that splits the time series into scans).
 
     config = {
-        # Nantucket configurations
         ('nantucket', 'z01'): {
-            'qc_metric': 'intensity',
-            'qc_threshold': qc_threshold or 1.008,
             'wind_dir_correction': wind_dir_correction or get_wind_correction(location, 'z01'),
             'w_sign_correction': get_w_sign_correction('z01', location),
-            # reset_threshold=-50: more permissive than default (-200), verified
-            # harmless for the standard VAD wrap (300° -> 0° gives ~−300°).
+            # -50 rather than the -200 default; the VAD wrap (~-300°) still trips it.
             'segment_func': lambda ts, az, min_pts: identify_scanning_lidar_segments(ts, az, 'z01', min_pts, reset_threshold=-50)
         },
         ('nantucket', 'z02'): {
-            'qc_metric': 'intensity',
-            'qc_threshold': qc_threshold or 1.008,  
             'wind_dir_correction': wind_dir_correction or get_wind_correction(location, 'z02'),
             'w_sign_correction': get_w_sign_correction('z02', location),
             'segment_func': lambda ts, az, min_pts: identify_scanning_lidar_segments(ts, az, 'z02', min_pts)
         },
-        # Block Island configurations
         ('block_island', 'z01'): {
-            'qc_metric': 'intensity',
-            'qc_threshold': qc_threshold or 1.008, 
             'wind_dir_correction': wind_dir_correction or get_wind_correction(location, 'z01'),
             'w_sign_correction': get_w_sign_correction('z01', location),
             'segment_func': lambda ts, az, min_pts: identify_scanning_lidar_segments(ts, az, 'z01', min_pts)
         },
-        # Rhode Island configurations  
         ('rhode_island', 'z01'): {
-            'qc_metric': 'intensity',
-            'qc_threshold': qc_threshold or 1.008,
             'wind_dir_correction': wind_dir_correction or get_wind_correction(location, 'z01'),
             'w_sign_correction': get_w_sign_correction('z01', location),
             'segment_func': lambda ts, az, min_pts: identify_scanning_lidar_segments(ts, az, 'z01', min_pts)
         },
-        # Cape Cod configurations
         ('cape_cod', 'z02'): {
-            'qc_metric': 'intensity', 
-            'qc_threshold': qc_threshold or 1.008,  
             'wind_dir_correction': wind_dir_correction or get_wind_correction('cape_cod', 'z02'),
             'w_sign_correction': get_w_sign_correction('z02', 'cape_cod'),
             'segment_func': lambda ts, az, min_pts: identify_scanning_lidar_segments(ts, az, 'z02', min_pts)
         }
     }
-    
-    # Get configuration for this location + instrument combination
+
     instrument_key = instrument_code.lower()
     config_key = (location, instrument_key)
     if config_key not in config:
         raise ValueError(f"Unsupported combination: {instrument_code} at {location}. "
                         f"Supported: {list(config.keys())}")
     cfg = config[config_key]
-    
-    if verbose:
-        print(f"Using {location} {instrument_key} config: {cfg['qc_metric']} threshold {cfg['qc_threshold']}")
 
-    # Time filtering
+    # QC signal, threshold, and beam minimum come from config.QC_CONFIG:
+    # the single source of truth shared with the availability calculation.
+    qc_cfg = get_qc_params(location, instrument_key)
+    qc_metric = qc_cfg['qc_type']
+    qc_threshold = qc_cfg['threshold']
+    if min_beams is None:
+        min_beams = qc_cfg.get('min_beams', MIN_VAD_BEAMS)
+
+    if verbose:
+        print(f"Using {location} {instrument_key} QC: {qc_metric} threshold {qc_threshold}, min_beams {min_beams}")
+
     times = pd.to_datetime(ds.time.values)
     end_time = start_time + pd.Timedelta(minutes=time_window)
     time_mask = (times >= start_time) & (times < end_time)
@@ -524,13 +478,10 @@ def process_scanning_lidar(ds, start_time, instrument_code, location, time_windo
     if verbose:
         print(f"Processing {instrument_key} combined data from {start_time} to {end_time}")
 
-    # Load and prepare data
     heights = ds.distance.values
     if heights.ndim == 2:
         # For 2D arrays, take heights from first time point (assuming consistent across time)
-        # Use dimension names for more reliable extraction
         if 'range_gate' in ds.distance.dims and ds.distance.dims[0] == 'time':
-            # Shape is (time, range_gate) - take first time point
             heights = heights[0, :]
         elif heights.shape[0] > heights.shape[1]:
             # Shape is (time, height) - take first time point
@@ -539,36 +490,40 @@ def process_scanning_lidar(ds, start_time, instrument_code, location, time_windo
             # Shape is (height, time) - take first column  
             heights = heights[:, 0]
     elif heights.ndim == 1:
-        # Already 1D, use as-is
         pass
     else:
         raise ValueError(f"Unexpected distance array dimensions: {heights.shape}")
-    # Ensure it's a 1D array of scalars
     heights = np.asarray(heights).flatten()
 
     vr_data = ds.radial_wind_speed[time_mask, :].values
     azimuth_data = ds.azimuth[time_mask].values
     elevation_data = ds.elevation[time_mask].values
 
-    # Convert slant range to geometric height above instrument
-    # For scanning lidars at ~60° elevation, height = distance * sin(elevation)
+    # Keep only beams at the VAD cone elevation (see VAD_ELEVATION_DEG above).
+    vad_mask = np.abs(elevation_data - VAD_ELEVATION_DEG) < VAD_ELEVATION_TOL_DEG
+    if not vad_mask.any():
+        return None
+    vr_data = vr_data[vad_mask, :]
+    azimuth_data = azimuth_data[vad_mask]
+    elevation_data = elevation_data[vad_mask]
+    window_times = times[time_mask][vad_mask]
+
+    # Slant range to geometric height: height = distance * sin(elevation).
     median_elevation = np.nanmedian(elevation_data)
     heights = heights * np.sin(np.radians(median_elevation))
 
-    # Quality control data - now location and instrument specific
-    if cfg['qc_metric'] == 'snr':
-        qc_data = ds.SNR[time_mask, :].values
-    elif cfg['qc_metric'] == 'intensity':
-        qc_data = ds.intensity[time_mask, :].values
+    if qc_metric == 'snr':
+        qc_data = ds.SNR[time_mask, :].values[vad_mask, :]
+    elif qc_metric == 'intensity':
+        qc_data = ds.intensity[time_mask, :].values[vad_mask, :]
     else:
-        raise ValueError(f"Unsupported QC metric: {cfg['qc_metric']}")
+        raise ValueError(f"Unsupported QC metric: {qc_metric}")
 
     ground_elevation = get_ground_elevation_from_config(location, instrument_code)
 
-    # Prepare data structure
     filtered_data = {
         'heights': heights,
-        'time': times[time_mask],
+        'time': window_times,
         'position': azimuth_data,
         'measurements': {}
     }
@@ -577,20 +532,17 @@ def process_scanning_lidar(ds, start_time, instrument_code, location, time_windo
         if height < 100:  # Skip heights <100m for scanning lidars
             continue
         filtered_data['measurements'][height] = {
-            cfg['qc_metric']: qc_data[:, i],
+            qc_metric: qc_data[:, i],
             'vr': vr_data[:, i],
             'azimuth': azimuth_data,
             'elevation': elevation_data,
-            'timestamps': times[time_mask]
+            'timestamps': window_times
         }
 
-    # Apply QC filtering
     qc_params = {
-        'qc_type': cfg['qc_metric'],
-        'threshold': cfg['qc_threshold'],
-        'min_beams': min_beams,
-        'az_range_threshold': az_range_threshold,
-        'min_height': 100
+        'qc_type': qc_metric,
+        'threshold': qc_threshold,
+        'min_beams': min_beams
     }
 
     filtered_results = filter_data_by_qc_criteria(
@@ -603,10 +555,11 @@ def process_scanning_lidar(ds, start_time, instrument_code, location, time_windo
     if filtered_results is None:
         return None
 
-    # Calculate availability using original data
-    availability_metrics = calculate_data_availability(filtered_results, filtered_data, availability_threshold)
+    # Calculate availability using the same QC rule as the beam filter
+    availability_metrics = calculate_data_availability(
+        filtered_results, filtered_data, availability_threshold,
+        qc_type=qc_metric, threshold=qc_threshold)
 
-    # Initialize results
     results = {
         'time': start_time,
         'instrument_code': f'lidar_{instrument_key}',
@@ -618,7 +571,6 @@ def process_scanning_lidar(ds, start_time, instrument_code, location, time_windo
         'availability': availability_metrics
     }
 
-    # Process each height for wind and turbulence
     for height, data in filtered_results['measurements'].items():
         availability = availability_metrics['height_availability'].get(height, {}).get('availability', 0)
         if availability < availability_threshold:
@@ -626,13 +578,11 @@ def process_scanning_lidar(ds, start_time, instrument_code, location, time_windo
                 print(f"Skipping height {height}m - availability {availability:.1%} < {availability_threshold:.1%}")
             continue
 
-        # Prepare QC-filtered data
         az = data['azimuth']
         el = data['elevation']
         vr = data['vr']
         timestamps_qc = data['timestamps']
 
-        # Remove remaining NaNs
         valid_mask = ~np.isnan(vr)
         az_valid = az[valid_mask]
         el_valid = el[valid_mask]
@@ -644,9 +594,9 @@ def process_scanning_lidar(ds, start_time, instrument_code, location, time_windo
                 print(f"Height {height}m: Insufficient valid data after NaN removal: {len(vr_valid)} < {min_beams}")
             continue
 
-        true_agl_height = height - ground_elevation
+        # Heights are already AGL; ground_elevation is ASL, carried for metadata.
+        true_agl_height = height
 
-        # Wind Profile: VAD fitting
         wind_profile = fit_chi_winds(az_valid, el_valid, vr_valid)
 
         if not np.isnan(wind_profile['ws']):
@@ -655,7 +605,6 @@ def process_scanning_lidar(ds, start_time, instrument_code, location, time_windo
             wind_profile['availability'] = availability
             results['wind_profiles'][true_agl_height] = round_profile_values(wind_profile)
         
-        # Turbulence Profile: scan-based analysis
         turbulence_metrics = process_turbulence_from_scans(
             timestamps_valid, az_valid, el_valid, vr_valid,
             instrument=instrument_key,
@@ -675,12 +624,15 @@ def process_scanning_lidar(ds, start_time, instrument_code, location, time_windo
     return results
 
 def process_profiling_lidar(parsed_data, start_time, location, time_window=TIME_WINDOW_MINUTES,
-                     cnr_threshold=-23, min_beams=5, wind_dir_correction=None,
-                     min_beams_per_scan=3, az_range_threshold=180,
+                     wind_dir_correction=None, min_beams_per_scan=3,
                      availability_threshold=0.5, ground_elevation=None,
                      verbose=False):
     """
-    Unified z03 lidar processor for both RTD, STA, and CSV formats
+    Unified z03 lidar processor for both RTD, STA, and CSV formats.
+
+    QC rules (CNR threshold for RTD/STA, sample/rain gating for the ZephIR
+    CSV, and the VAD beam minimum) come from ``config.QC_CONFIG`` per site.
+
     Parameters:
     -----------
     parsed_data : dict
@@ -691,20 +643,14 @@ def process_profiling_lidar(parsed_data, start_time, location, time_window=TIME_
         Location identifier ('nantucket', 'block island', etc.)
     time_window : int, optional
         Processing window duration in minutes (default: 10)
-    cnr_threshold : float, optional
-        Minimum acceptable Carrier-to-Noise Ratio in dB (default: -23)
-    min_beams : int, optional
-        Minimum number of valid beams required for VAD fitting (default: 5)
     wind_dir_correction : float, optional
         Wind direction correction. If None, uses location defaults
     min_beams_per_scan : int, optional
         Minimum beams required per scan segment for turbulence analysis (default: 3)
-    az_range_threshold : float, optional
-        Minimum azimuth range in degrees for valid scans (default: 180)
     availability_threshold : float, optional
         Minimum data availability fraction (0-1) for height inclusion (default: 0.5)
     ground_elevation : float, optional
-        Ground elevation in meters. If None, retrieved from USGS service
+        Ignored: the value is read from the site config.
     verbose : bool, optional
         Enable detailed processing output (default: False)
     Returns:
@@ -714,19 +660,18 @@ def process_profiling_lidar(parsed_data, start_time, location, time_window=TIME_
     """
     if parsed_data is None:
         return None
+
+    qc_cfg = get_qc_params(location, 'z03')
     
-    # Get wind direction correction
     if wind_dir_correction is None:
         wind_dir_correction = get_wind_correction(location, 'z03')
     
-    # Extract coordinates from parsed data
     if 'latitude' in parsed_data and 'longitude' in parsed_data:
         latitude = parsed_data['latitude']
         longitude = parsed_data['longitude']
     elif 'metadata' in parsed_data and parsed_data['metadata'].get('gps_coords'):
         latitude, longitude = parsed_data['metadata']['gps_coords']
     else:
-        # Fallback to location-based coordinates
         fallback_coords = get_instrument_coordinates(location, 'z03_lidar')
         if fallback_coords:
             latitude, longitude = fallback_coords[0], fallback_coords[1]
@@ -738,29 +683,32 @@ def process_profiling_lidar(parsed_data, start_time, location, time_window=TIME_
     # Ground elevation comes from the site config (USGS-derived values cached there)
     ground_elevation = get_ground_elevation_from_config(location, 'z03')
 
-    # Determine file type and route to appropriate processor
     file_type = parsed_data.get('file_type', 'rtd')  # Default to RTD if not specified
 
     if file_type == 'rtd':
-        return _process_profiling_rtd(parsed_data, start_time, time_window, cnr_threshold,
-                               min_beams, wind_dir_correction, min_beams_per_scan,
-                               az_range_threshold, availability_threshold,
+        return _process_profiling_rtd(parsed_data, start_time, time_window,
+                               qc_cfg['threshold'],
+                               qc_cfg.get('min_beams', MIN_VAD_BEAMS),
+                               wind_dir_correction, min_beams_per_scan,
+                               availability_threshold,
                                ground_elevation, latitude, longitude, location, verbose)
     elif file_type == 'sta':
-        return _process_profiling_sta(parsed_data, start_time, time_window, cnr_threshold,
+        return _process_profiling_sta(parsed_data, start_time, time_window,
+                               qc_cfg['threshold'],
                                availability_threshold, ground_elevation,
                                wind_dir_correction, latitude, longitude, location, verbose)
     elif file_type == 'csv':
         return _process_profiling_csv(parsed_data, start_time, time_window,
                                availability_threshold, ground_elevation,
-                               wind_dir_correction, latitude, longitude, location, verbose)
+                               wind_dir_correction, latitude, longitude, location,
+                               verbose, min_samples=qc_cfg.get('min_samples', 20))
     else:
         if verbose:
             print(f"Unknown profiling lidar file type: {file_type}")
         return None
 
 def _process_profiling_rtd(rtd_data, start_time, time_window, cnr_threshold, min_beams,
-                    wind_dir_correction, min_beams_per_scan, az_range_threshold,
+                    wind_dir_correction, min_beams_per_scan,
                     availability_threshold, ground_elevation, latitude, longitude,
                     location, verbose):
     """Process WindCube RTD format (scanning pattern). Used at Nantucket in WFIP3"""
@@ -776,7 +724,6 @@ def _process_profiling_rtd(rtd_data, start_time, time_window, cnr_threshold, min
     if verbose:
         print(f"Processing z03 RTD data from {start_time} to {end_time}")
     
-    # Prepare data structure for QC - need to restructure RTD data
     filtered_data = {
         'heights': rtd_data['heights'],
         'time': times[time_mask],
@@ -784,13 +731,11 @@ def _process_profiling_rtd(rtd_data, start_time, time_window, cnr_threshold, min
         'measurements': {}
     }
     
-    # Structure measurements for QC
     for height in rtd_data['heights']:
         if height not in rtd_data['measurements']:
             continue
         
         height_data = rtd_data['measurements'][height]
-        # Apply time mask to all measurements for this height
         filtered_data['measurements'][height] = {
             'cnr': height_data['cnr'][time_mask],
             'vr': height_data['vr'][time_mask],
@@ -798,21 +743,20 @@ def _process_profiling_rtd(rtd_data, start_time, time_window, cnr_threshold, min
             'position': rtd_data['position'][time_mask]  # Include position for each height
         }
     
-    # Apply QC (shared for both wind and turbulence)
     qc_params = {
         'qc_type': 'cnr',
         'threshold': cnr_threshold,
-        'min_beams': min_beams,
-        'az_range_threshold': az_range_threshold
+        'min_beams': min_beams
     }
     
     filtered_results = filter_data_by_qc_criteria(filtered_data, instrument='z03', qc_params=qc_params, verbose=verbose)
     if filtered_results is None:
         return None
     
-    availability_metrics = calculate_data_availability(filtered_results, filtered_data, availability_threshold)
+    availability_metrics = calculate_data_availability(
+        filtered_results, filtered_data, availability_threshold,
+        qc_type='cnr', threshold=cnr_threshold)
     
-    # Initialize combined results
     results = {
         'time': start_time,
         'instrument_code': 'lidar_z03',
@@ -824,7 +768,6 @@ def _process_profiling_rtd(rtd_data, start_time, time_window, cnr_threshold, min
         'availability': availability_metrics
     }
     
-    # Process each height for both wind and turbulence
     for height, data in filtered_results['measurements'].items():
         availability = availability_metrics['height_availability'].get(height, {}).get('availability', 0)
         
@@ -833,25 +776,22 @@ def _process_profiling_rtd(rtd_data, start_time, time_window, cnr_threshold, min
                 print(f"Skipping height {height}m - availability {availability:.1%} < {availability_threshold:.1%}")
             continue
         
-        true_agl_height = height - ground_elevation
+        # Heights are already AGL; ground_elevation is ASL, carried for metadata.
+        true_agl_height = height
         
-        # Extract measurements - data is already QC filtered
         vr = data['vr']
         positions = data['position']
         timestamps_qc = data['timestamps']
         
-        # Convert positions to azimuth angles, filter out vertical beams and NaN VR
         az_angles = []
         el_angles = []
         vr_valid = []
         timestamps_valid = []
         
         for i, (pos, vr_val, ts) in enumerate(zip(positions, vr, timestamps_qc)):
-            # Skip NaN values and vertical beams
             if np.isnan(vr_val) or pos == 'V':
                 continue
             
-            # Convert position to float
             try:
                 az_angle = float(pos)
             except (ValueError, TypeError):
@@ -862,7 +802,6 @@ def _process_profiling_rtd(rtd_data, start_time, time_window, cnr_threshold, min
             vr_valid.append(vr_val)
             timestamps_valid.append(ts)
         
-        # Convert to numpy arrays
         az_angles = np.array(az_angles)
         el_angles = np.array(el_angles)
         vr_valid = np.array(vr_valid)
@@ -873,7 +812,6 @@ def _process_profiling_rtd(rtd_data, start_time, time_window, cnr_threshold, min
                 print(f"Height {height}m: Insufficient valid data: {len(vr_valid)} < {min_beams}")
             continue
         
-        # Wind Profile: Single VAD fit using all valid data
         wind_profile = fit_chi_winds(az_angles, el_angles, vr_valid)
         if not np.isnan(wind_profile['ws']):
             wind_profile['wd'] = (wind_profile['wd'] + wind_dir_correction) % 360
@@ -881,7 +819,6 @@ def _process_profiling_rtd(rtd_data, start_time, time_window, cnr_threshold, min
             wind_profile['availability'] = availability
             results['wind_profiles'][true_agl_height] = round_profile_values(wind_profile)
         
-        # Turbulence Profile: scan-based analysis
         turbulence_metrics = process_turbulence_from_scans(
             timestamps_valid, az_angles, el_angles, vr_valid,
             instrument='z03',
@@ -929,13 +866,11 @@ def _process_profiling_sta(sta_data, start_time, time_window, cnr_threshold,
     for height in sta_data['heights']:
         height_data = sta_data['measurements'][height]
         
-        # Skip heights with no data
         if len(height_data['u_native']) == 0:
             if verbose:
                 print(f"Height {height}m: Skipping - no data")
             continue
         
-        # Apply time and CNR filters
         cnr_vals = np.array(height_data['cnr'])
         mask = time_mask & (cnr_vals >= cnr_threshold)
         
@@ -944,7 +879,6 @@ def _process_profiling_sta(sta_data, start_time, time_window, cnr_threshold,
                 print(f"Height {height}m: No data above CNR threshold {cnr_threshold}")
             continue
         
-        # Extract filtered data (native coordinates)
         u_native_vals = np.array(height_data['u_native'])[mask]
         v_native_vals = np.array(height_data['v_native'])[mask]
         w_native_vals = np.array(height_data['w_native'])[mask]
@@ -955,7 +889,6 @@ def _process_profiling_sta(sta_data, start_time, time_window, cnr_threshold,
         std_vhm_vals = np.array(height_data['std_vhm'])[mask]
         avail_vals = np.array(height_data['availability'])[mask]
         
-        # Remove NaN values
         valid_mask = ~(np.isnan(u_native_vals) | np.isnan(v_native_vals))
         if not valid_mask.any():
             continue
@@ -970,7 +903,6 @@ def _process_profiling_sta(sta_data, start_time, time_window, cnr_threshold,
         std_vhm_final = std_vhm_vals[valid_mask]
         avail_final = avail_vals[valid_mask]
         
-        # Check availability threshold
         avg_availability = np.nanmean(avail_final) / 100.0  # Convert percent to fraction
         if avg_availability < availability_threshold:
             if verbose:
@@ -998,13 +930,12 @@ def _process_profiling_sta(sta_data, start_time, time_window, cnr_threshold,
         tke = 0.5 * (std_u_met_mean**2 + std_v_met_mean**2 + std_w_met_mean**2)
         ti = np.sqrt(tke) / ws if ws > 0 else np.nan
         
-        # Also use scalar wind speed statistics
         scalar_ws_mean = np.nanmean(vhm_final)
         scalar_ws_std = np.nanmean(std_vhm_final)
         
-        true_agl_height = height - ground_elevation
+        # Heights are already AGL; ground_elevation is ASL, carried for metadata.
+        true_agl_height = height
         
-        # Wind profile
         wind_profile = {
             'u': u_met_mean,
             'v': v_met_mean,
@@ -1015,7 +946,6 @@ def _process_profiling_sta(sta_data, start_time, time_window, cnr_threshold,
             'scalar_ws': scalar_ws_mean  # Additional scalar wind speed
         }
         
-        # Turbulence profile
         turbulence_profile = {
             'std_u': std_u_met_mean,
             'std_v': std_v_met_mean,
@@ -1078,7 +1008,6 @@ def clean_missing_values(data_array):
     """Fast vectorized missing value cleaning"""
     data_clean = data_array.copy()
     
-    # All missing indicators in one operation
     missing_values = [9999, 9999.0, 9999.9, 10000, -9999, -9999.0, 99999]
     missing_mask = np.isin(data_clean, missing_values)
     data_clean[missing_mask] = np.nan
@@ -1087,7 +1016,7 @@ def clean_missing_values(data_array):
 
 def _process_profiling_csv(csv_data, start_time, time_window, availability_threshold,
                     ground_elevation, wind_dir_correction, latitude, longitude,
-                    location, verbose):
+                    location, verbose, min_samples=20):
     """
     Process profiling lidar CSV format (pre-computed wind statistics with coordinate transform).
     Used at Narragansett/Rhode Island (ZephIR-300) in WFIP3.
@@ -1119,7 +1048,6 @@ def _process_profiling_csv(csv_data, start_time, time_window, availability_thres
     if verbose:
         print(f"Processing Z03 CSV data from {start_time} to {start_time + pd.Timedelta(minutes=time_window)}")
     
-    # Time filtering
     times = csv_data['time']
     end_time = start_time + pd.Timedelta(minutes=time_window)
     time_mask = (times >= start_time) & (times < end_time)
@@ -1129,10 +1057,8 @@ def _process_profiling_csv(csv_data, start_time, time_window, availability_thres
             print("No Z03 CSV data in time window")
         return None
     
-    # Get the original DataFrame for QC filtering
     df = csv_data['metadata']['original_df']
     
-    # Initialize results
     results = {
         'time': start_time,
         'instrument_code': 'lidar_z03',
@@ -1147,11 +1073,9 @@ def _process_profiling_csv(csv_data, start_time, time_window, availability_thres
     total_availability = 0
     processed_heights = 0
     
-    # Process each height
     for height in csv_data['heights']:
         height_data = csv_data['measurements'][height]
         
-        # Apply time mask to height data
         time_filtered_data = {}
         for key, values in height_data.items():
             time_filtered_data[key] = values[time_mask]
@@ -1169,16 +1093,16 @@ def _process_profiling_csv(csv_data, start_time, time_window, availability_thres
             if verbose and np.sum(~rain_mask) > 0:
                 print(f"Height {height}m: Filtered out {np.sum(~rain_mask)} data points due to rain")
         
-        # 2. Sample count filter: Remove data with insufficient samples (Nlidar < 20)
+        # 2. Sample count filter: drop records averaged from too few packets
+        # (QC_CONFIG 'samples_rain': min_samples)
         packets_mask = np.ones(len(time_filtered_data['wind_speed']), dtype=bool)  # Default: keep all
         packets_col = f'Packets in Average at {int(height)}m'
         if packets_col in df.columns:
             packets_vals = df[packets_col][time_mask].values
-            packets_mask = packets_vals >= 20  # Keep packets >= 20
+            packets_mask = packets_vals >= min_samples
             if verbose and np.sum(~packets_mask) > 0:
-                print(f"Height {height}m: Filtered out {np.sum(~packets_mask)} data points due to insufficient samples (< 20)")
+                print(f"Height {height}m: Filtered out {np.sum(~packets_mask)} data points due to insufficient samples (< {min_samples})")
         
-        # 3. Combine Rhode Island QC masks
         ri_qc_mask = rain_mask & packets_mask
         
         if not ri_qc_mask.any():
@@ -1186,11 +1110,9 @@ def _process_profiling_csv(csv_data, start_time, time_window, availability_thres
                 print(f"Height {height}m: No data passed Rhode Island Z03 QC filters")
             continue
 
-        # Apply Rhode Island QC mask
         if not ri_qc_mask.any():
             continue
             
-        # Extract all QC-filtered data at once
         qc_data = {
             'wind_speed': time_filtered_data['wind_speed'][ri_qc_mask],
             'wind_direction': time_filtered_data['wind_direction'][ri_qc_mask], 
@@ -1198,7 +1120,6 @@ def _process_profiling_csv(csv_data, start_time, time_window, availability_thres
             'TI': time_filtered_data['TI'][ri_qc_mask]
         }
 
-        # Clean all at once
         wind_speed_vals = clean_missing_values(qc_data['wind_speed'])
         wind_dir_vals = clean_missing_values(qc_data['wind_direction'])
         w_vals = clean_missing_values(qc_data['w'])
@@ -1214,28 +1135,26 @@ def _process_profiling_csv(csv_data, start_time, time_window, availability_thres
         valid_points = np.sum(~np.isnan(wind_speed_vals))     # After all QC + NaN filtering
         availability = valid_points / total_points if total_points > 0 else 0
         
-        # Check availability threshold
         if availability < availability_threshold:
             if verbose:
                 print(f"Height {height}m: Availability {availability:.1%} < {availability_threshold:.1%} after Rhode Island QC")
             continue
         
-        # Calculate mean values (removing NaNs)
+        # Wind direction uses the circular mean so rows straddling 0/360°
+        # cannot collapse toward 180°.
         mean_wind_speed = np.nanmean(wind_speed_vals)
-        mean_wind_dir = np.nanmean(wind_dir_vals)
+        wd_finite = wind_dir_vals[np.isfinite(wind_dir_vals)]
+        mean_wind_dir = float(wind_direction_average(wd_finite)) if len(wd_finite) else np.nan
         mean_w = np.nanmean(w_vals)
         mean_ti = np.nanmean(ti_vals)
         
-        # Skip if insufficient valid data
         if np.isnan(mean_wind_speed) or np.isnan(mean_wind_dir):
             if verbose:
                 print(f"Height {height}m: Insufficient valid wind data after all QC")
             continue
         
-        # Apply wind direction correction
         corrected_wind_dir = (mean_wind_dir + wind_dir_correction) % 360
         
-        # Apply w sign correction
         w_correction = get_w_sign_correction('z03', location)
         corrected_w = mean_w * w_correction
         
@@ -1244,10 +1163,9 @@ def _process_profiling_csv(csv_data, start_time, time_window, availability_thres
         u_component = -mean_wind_speed * np.sin(wind_dir_rad)  # Meteorological convention
         v_component = -mean_wind_speed * np.cos(wind_dir_rad)
         
-        # Calculate AGL height
-        true_agl_height = height - ground_elevation
+        # Heights are already AGL; ground_elevation is ASL, carried for metadata.
+        true_agl_height = height
         
-        # Store wind profile
         wind_profile = {
             'u': u_component,
             'v': v_component,
@@ -1257,19 +1175,16 @@ def _process_profiling_csv(csv_data, start_time, time_window, availability_thres
             'availability': availability
         }
         
-        # Store turbulence profile
         turbulence_profile = {}
         if not np.isnan(mean_ti):
             turbulence_profile = {
                 'ti': mean_ti,
             }
         
-        # Round and store results
         results['wind_profiles'][true_agl_height] = round_profile_values(wind_profile)
         if turbulence_profile:
             results['turbulence_profiles'][true_agl_height] = round_profile_values(turbulence_profile)
         
-        # Track availability
         results['availability']['height_availability'][true_agl_height] = {
             'availability': round(availability, 3),
             'meets_threshold': availability >= availability_threshold
@@ -1284,7 +1199,6 @@ def _process_profiling_csv(csv_data, start_time, time_window, availability_thres
                   f"WD={corrected_wind_dir:.1f}°, TI={mean_ti:.3f}, Avail={availability:.1%}")
             print(f"  QC summary - Rain filtered: {rain_filtered}, Low packets filtered: {packets_filtered}")
     
-    # Calculate overall availability
     if processed_heights > 0:
         results['availability']['total_availability'] = round(total_availability / processed_heights, 3)
         results['availability']['meets_threshold'] = any(
@@ -1296,62 +1210,64 @@ def _process_profiling_csv(csv_data, start_time, time_window, availability_thres
         turb_count = len(results['turbulence_profiles'])
         print(f"Final Z03 CSV results: {wind_count} wind profiles, {turb_count} turbulence profiles")
     
-    # Return None if no successful profiles
     if not results['wind_profiles'] and not results['turbulence_profiles']:
         return None
         
     return results
 
 def process_caco_z01_lidar(parsed_data, start_time, location='cape_cod', time_window=TIME_WINDOW_MINUTES,
-                          cnr_threshold=-23, availability_threshold=0.5, ground_elevation=None,
+                          availability_threshold=0.5, ground_elevation=None,
                           wind_dir_correction=None, verbose=False):
     """
     Process the CACO z01 profiling lidar (WindCube V2-96) for one 10-minute window.
 
-    CACO's profiling lidar is labeled z01 (not z03 like other sites' profiling lidars) 
-    and delivered as pre-aggregated 10-minute profiles. No raw beams available; this 
-    function applies only azimuth and vertical-velocity-sign corrections.
+    CACO's profiling lidar is labeled z01 (not z03 like other sites' profiling lidars)
+    and delivered as pre-aggregated 10-minute profiles. QC is applied upstream by the
+    instrument (QC_CONFIG 'prefiltered'; the vendor blanks wind wherever its own
+    screening fails), so this function applies only azimuth and
+    vertical-velocity-sign corrections plus NaN screening.
+
+    Turbulence is limited to intensity: the workbook reports a within-window wind
+    speed dispersion but no component variances, so TKE and the component standard
+    deviations would need an isotropy assumption and are left unreported. Intensity
+    is gated on the vendor's per-height availability (QC_CONFIG 'min_ti_availability').
 
     Parameters
     ----------
     parsed_data : dict
         Output of ``lidar_parsers.parse_caco_lidar_file``, containing
-        ``time``, ``heights``, ``wind_speed``, ``wind_direction``, and
-        ``vertical_velocity`` arrays plus latitude/longitude metadata.
+        ``time``, ``heights``, ``wind_speed``, ``wind_direction``,
+        ``w``, and ``ws_dispersion`` arrays plus latitude/longitude metadata.
     start_time : datetime
         Beginning of the 10-minute window to extract.
     location : str
         Site key (defaults to 'cape_cod').
-    cnr_threshold : float
-        Retained for API symmetry with other lidar processors; not used by
-        the CACO pipeline because raw CNR is not available.
     wind_dir_correction : float, optional
         Override the per-site azimuth correction from ``config.py``.
 
     Returns
     -------
     dict or None
-        Profile dict with ``wind_speed``, ``wind_direction``, ``w``,
-        ``heights``, ``latitude``, ``longitude``, and metadata; ``None`` if
-        no data falls in the window.
+        Profile dict with ``wind_profiles`` (u, v, w, ws, wd, availability),
+        ``turbulence_profiles`` (ti), ``latitude``, ``longitude``, and
+        metadata; ``None`` if no data falls in the window.
     """
     if parsed_data is None:
         return None
     
-    # Get coordinates
     latitude = parsed_data['latitude']
     longitude = parsed_data['longitude']
     
-    # Get wind direction correction
     if wind_dir_correction is None:
         wind_dir_correction = get_wind_correction(location, 'z01')
 
     ground_elevation = get_ground_elevation_from_config(location, 'z01')
     
-    # Get w sign correction
     w_correction = get_w_sign_correction('z01', location)
-    
-    # Time filtering
+
+    # Vendor availability minimum, consulted for turbulence only.
+    min_ti_availability = get_qc_params(location, 'z01')['min_ti_availability']
+
     times = parsed_data['time']
     end_time = start_time + pd.Timedelta(minutes=time_window)
     time_mask = (times >= start_time) & (times < end_time)
@@ -1363,9 +1279,8 @@ def process_caco_z01_lidar(parsed_data, start_time, location='cape_cod', time_wi
     
     if verbose:
         print(f"Processing CACO Z01 profiling data from {start_time} to {end_time}")
-        print(f"Using CNR threshold: {cnr_threshold} dB")
+        print("QC: prefiltered upstream by the instrument (no pipeline CNR gate)")
     
-    # Initialize results
     results = {
         'time': start_time,
         'instrument_code': 'lidar_caco_z01',
@@ -1380,63 +1295,62 @@ def process_caco_z01_lidar(parsed_data, start_time, location='cape_cod', time_wi
     total_availability = 0
     processed_heights = 0
     
-    # Process each height
     for height in parsed_data['heights']:
         height_data = parsed_data['measurements'][height]
         
-        # Apply time mask
         wind_speed_vals = height_data['wind_speed'][time_mask]
-        wind_dir_vals = height_data['wind_direction'][time_mask] 
+        wind_dir_vals = height_data['wind_direction'][time_mask]
         w_vals = height_data['w'][time_mask]
-        cnr_vals = height_data['cnr'][time_mask]
-        availability_vals = height_data['availability'][time_mask]
-        
+        ws_dispersion_vals = height_data['ws_dispersion'][time_mask]
+        vendor_availability_vals = height_data['availability'][time_mask]
+
         if len(wind_speed_vals) == 0:
             continue
-        
-        # Apply CNR filtering
-        cnr_mask = cnr_vals >= cnr_threshold
-        if not cnr_mask.any():
-            if verbose:
-                print(f"Height {height}m: No data above CNR threshold {cnr_threshold} dB")
-            continue
-        
-        # Apply CNR mask to all variables
-        wind_speed_filtered = wind_speed_vals[cnr_mask]
-        wind_dir_filtered = wind_dir_vals[cnr_mask]
-        w_filtered = w_vals[cnr_mask]
-        availability_filtered = availability_vals[cnr_mask]
-        
-        # Additional NaN filtering
-        valid_mask = ~(np.isnan(wind_speed_filtered) | np.isnan(wind_dir_filtered))
+
+        # Wind is prefiltered upstream by the vendor, so only NaN screening remains.
+        valid_mask = ~(np.isnan(wind_speed_vals) | np.isnan(wind_dir_vals))
         if not valid_mask.any():
             if verbose:
-                print(f"Height {height}m: No valid wind data after CNR and NaN filtering")
+                print(f"Height {height}m: No valid wind data in window")
             continue
-        
-        # Calculate data availability (CNR-filtered data / total data)
+
+        # Calculate data availability (valid data / total data)
         total_points = len(wind_speed_vals)
         valid_points = np.sum(valid_mask)
         availability = valid_points / total_points if total_points > 0 else 0
-        
-        # Check availability threshold
+
         if availability < availability_threshold:
             if verbose:
                 print(f"Height {height}m: Availability {availability:.1%} < {availability_threshold:.1%}")
             continue
-        
-        # Calculate mean values from valid, CNR-filtered data
-        mean_wind_speed = np.nanmean(wind_speed_filtered[valid_mask])
-        mean_wind_dir = np.nanmean(wind_dir_filtered[valid_mask])
-        mean_w = np.nanmean(w_filtered[valid_mask])
-        
-        # Skip if insufficient valid data
+
+        # Wind direction uses the circular mean (0/360°-safe).
+        mean_wind_speed = np.nanmean(wind_speed_vals[valid_mask])
+        mean_wind_dir = float(wind_direction_average(wind_dir_vals[valid_mask]))
+        mean_w = np.nanmean(w_vals[valid_mask])
+
+        # TI from the vendor's within-window wind speed dispersion, the same
+        # scan-to-scan sigma(WS) the high-rate processors compute. Denominator is
+        # the scalar mean, not the Rosenbusch (2021) hybrid used elsewhere, which
+        # needs both scalar and vector means the workbook does not deliver. Ratios
+        # are formed per record then averaged; calm records (WS = 0) drop out.
+        # The vendor's per-height availability gates the dispersion (QC_CONFIG
+        # 'min_ti_availability'), a different quantity from the `availability`
+        # computed below, which is the fraction of non-NaN records in the window.
+        ti_mask = (valid_mask
+                   & np.isfinite(ws_dispersion_vals)
+                   & (wind_speed_vals > 0)
+                   & (vendor_availability_vals >= min_ti_availability))
+        if ti_mask.any():
+            mean_ti = float(np.nanmean(ws_dispersion_vals[ti_mask] / wind_speed_vals[ti_mask]))
+        else:
+            mean_ti = np.nan
+
         if np.isnan(mean_wind_speed) or np.isnan(mean_wind_dir):
             if verbose:
                 print(f"Height {height}m: Insufficient valid wind data")
             continue
         
-        # Apply corrections
         corrected_wind_dir = (mean_wind_dir + wind_dir_correction) % 360
         corrected_w = mean_w * w_correction
         
@@ -1445,10 +1359,9 @@ def process_caco_z01_lidar(parsed_data, start_time, location='cape_cod', time_wi
         u_component = -mean_wind_speed * np.sin(wind_dir_rad)
         v_component = -mean_wind_speed * np.cos(wind_dir_rad)
         
-        # Calculate AGL height
-        true_agl_height = height - ground_elevation
+        # Heights are already AGL; ground_elevation is ASL, carried for metadata.
+        true_agl_height = height
         
-        # Store wind profile
         wind_profile = {
             'u': u_component,
             'v': v_component,
@@ -1457,11 +1370,18 @@ def process_caco_z01_lidar(parsed_data, start_time, location='cape_cod', time_wi
             'wd': corrected_wind_dir,
             'availability': availability
         }
-        
-        # Store results
+
+        # Only intensity exists here, so the shared gate acts on the TI bound alone.
+        turbulence_profile = {}
+        if not np.isnan(mean_ti):
+            turbulence_profile = {'ti': mean_ti}
+            if apply_physics_based_qc(turbulence_profile):
+                turbulence_profile = {}
+
         results['wind_profiles'][true_agl_height] = round_profile_values(wind_profile)
-        
-        # Track availability
+        if turbulence_profile:
+            results['turbulence_profiles'][true_agl_height] = round_profile_values(turbulence_profile)
+
         results['availability']['height_availability'][true_agl_height] = {
             'availability': round(availability, 3),
             'meets_threshold': availability >= availability_threshold
@@ -1471,21 +1391,22 @@ def process_caco_z01_lidar(parsed_data, start_time, location='cape_cod', time_wi
         total_availability += availability
         
         if verbose:
+            ti_text = f"{mean_ti:.3f}" if not np.isnan(mean_ti) else "n/a"
             print(f"Height {height}m ({true_agl_height}m AGL): WS={mean_wind_speed:.2f} m/s, "
-                  f"WD={corrected_wind_dir:.1f}°, CNR>={cnr_threshold}dB, Avail={availability:.1%}")
-    
-    # Calculate overall availability
+                  f"WD={corrected_wind_dir:.1f}°, TI={ti_text}, Avail={availability:.1%}")
+
     if processed_heights > 0:
         results['availability']['total_availability'] = round(total_availability / processed_heights, 3)
         results['availability']['meets_threshold'] = any(
             info['meets_threshold'] for info in results['availability']['height_availability'].values()
         )
-    
+
     if verbose:
         wind_count = len(results['wind_profiles'])
-        print(f"Final CACO Z01 results: {wind_count} wind profiles (CNR >= {cnr_threshold} dB)")
+        turb_count = len(results['turbulence_profiles'])
+        print(f"Final CACO Z01 results: {wind_count} wind profiles, "
+              f"{turb_count} turbulence profiles (prefiltered upstream)")
     
-    # Return None if no successful profiles
     if not results['wind_profiles']:
         return None
         
@@ -1529,7 +1450,6 @@ def process_lidar_time_series(instrument_code, filename, start_time, end_time, l
         One profile dict per successfully processed window, in
         chronological order. Empty list on file-open failure.
     """
-    # Validate inputs
     if not os.path.exists(filename):
         print(f"Error: File not found: {filename}")
         return []
@@ -1538,17 +1458,14 @@ def process_lidar_time_series(instrument_code, filename, start_time, end_time, l
         print(f"Error: Invalid time range: {start_time} to {end_time}")
         return []
     
-    # Load data with error context
     try:
         if instrument_code in ['z01', 'z02']:
-            # Special handling for CACO Z01 (Excel format)
             if location.lower() == 'cape_cod' and instrument_code == 'z01':
                 ds = parse_caco_lidar_file(filename)
                 if ds is None or not ds.get('measurements'):
                     print(f"Error: Failed to read CACO Z01 file or no measurements")
                     return []
             else:
-                # Standard NetCDF scanning lidars
                 ds = xr.open_dataset(filename)
                 if 'time' not in ds or len(ds.time) == 0:
                     print(f"Error: No time data in {instrument_code} file")
@@ -1559,7 +1476,7 @@ def process_lidar_time_series(instrument_code, filename, start_time, end_time, l
                 print(f"Error: Failed to read z03 file or no measurements")
                 return []
         elif instrument_code.lower() == 'caco':
-            # Legacy CACO handling (should be same as CACO Z01)
+            # The site code is accepted as an alias for the Cape Cod z01 workbook
             ds = parse_caco_lidar_file(filename)
             if ds is None or not ds.get('measurements'):
                 print(f"Error: Failed to read CACO file or no measurements")
@@ -1573,10 +1490,8 @@ def process_lidar_time_series(instrument_code, filename, start_time, end_time, l
             traceback.print_exc()
         return []
 
-    # Get ground elevation from config
     ground_elevation = get_ground_elevation_from_config(location, instrument_code)
     
-    # Generate time intervals
     current_time = start_time.replace(minute=(start_time.minute // TIME_WINDOW_MINUTES) * TIME_WINDOW_MINUTES, second=0, microsecond=0)
     time_intervals = []
     while current_time < end_time:
@@ -1585,12 +1500,10 @@ def process_lidar_time_series(instrument_code, filename, start_time, end_time, l
     
     print(f"Processing {instrument_code} combined data: {len(time_intervals)} time intervals")
     
-    # Process each interval
     results = []
     for interval_time in time_intervals:
         try:
             if instrument_code in ['z01', 'z02']:
-                # Handle CACO Z01 as profiling lidar (like z03)
                 if location.lower() == 'cape_cod' and instrument_code == 'z01':
                     interval_result = process_caco_z01_lidar(ds, interval_time, location, time_window,
                                                 ground_elevation=ground_elevation, verbose=verbose, **kwargs)
@@ -1602,7 +1515,6 @@ def process_lidar_time_series(instrument_code, filename, start_time, end_time, l
                 interval_result = process_profiling_lidar(ds, interval_time, location, time_window,
                                             ground_elevation=ground_elevation, **kwargs)
             elif instrument_code.lower() == 'caco':
-                # Legacy CACO handling
                 interval_result = process_caco_z01_lidar(ds, interval_time, location, time_window,
                                             ground_elevation=ground_elevation, verbose=verbose, **kwargs)
             else:
@@ -1615,7 +1527,6 @@ def process_lidar_time_series(instrument_code, filename, start_time, end_time, l
                 print(f"Error processing {instrument_code} interval at {interval_time}: {e}")
             continue
     
-    # Ensure cleanup
     try:
         if hasattr(ds, 'close'):
             ds.close()

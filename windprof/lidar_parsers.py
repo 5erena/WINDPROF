@@ -1,18 +1,11 @@
-"""Format-specific readers for the various profiling lidar file conventions
+"""Format-specific readers for the profiling lidar file conventions.
 
-The WFIP3 profiling lidars wrote three different file formats across sites:
+  - ``.rtd``: WindCube V2.1 native (Nantucket)
+  - ``.sta``: WindCube V1 native (Block Island)
+  - ``.csv``: WindCube V2-96 and ZephIR-300 export (Rhode Island)
 
-  - ``.rtd`` (real-time data): WindCube V2.1 native format
-  - ``.sta`` (statistics): WindCube V1 native format
-  - ``.csv``: WindCube V2-96 and ZephIR-300 export format
-
-``parse_profiling_lidar_file`` auto-detects format by extension and dispatches to
-the matching parser. CACO uses an Excel-workbook delivery format
-(``parse_caco_lidar_file``) covered separately because its z01-as-
-profiling convention diverges from the other three sites' z03 layout.
-
-Adapters introducing a new profiling lidar format may add a parser
-function here and register it in ``parse_profiling_lidar_file``'s dispatch.
+``parse_profiling_lidar_file`` dispatches on extension. Cape Cod is separate
+(``parse_caco_lidar_file``): its profiling lidar is z01, not z03.
 """
 
 import numpy as np
@@ -24,9 +17,7 @@ from .config import get_instrument_coordinates
 ### z03 Auto-Detection and Parsing
 
 def detect_profiling_lidar_file_type(filepath):
-    """
-    z03 ships in three different formats depending on site. Dispatch by extension.
-    """
+    """Return the format tag for a z03 file: 'sta', 'rtd', 'csv', or None."""
     if filepath.lower().endswith('.sta'):
         return 'sta'
     elif filepath.lower().endswith('.rtd'):
@@ -53,10 +44,8 @@ def parse_profiling_lidar_file(filepath, verbose=False):
 
 def parse_profiling_rtd_file(filepath, verbose=False):
     """
-    Parse a Leosphere RTD file (Nantucket-era z03). Header is fixed-line:
-    GPS on line 6, height list on line 40, and the data table begins at
-    line 43. Heights and the per-height column block names are derived
-    from the header rather than hardcoded.
+    Parse a Leosphere RTD file (Nantucket-era z03). Header line positions are
+    fixed; heights and the per-height column names are read from the header.
     """
     if not os.path.exists(filepath):
         print(f"Error: RTD file not found: {filepath}")
@@ -98,7 +87,7 @@ def parse_profiling_rtd_file(filepath, verbose=False):
             print("No heights found in header")
             return None
 
-        # RTD lacks GPS in some header revisions — fall back to the site config
+        # RTD lacks GPS in some header revisions, so fall back to the site config
         #  (RTD is only for Nantucket here).
         if latitude is None or longitude is None:
             fallback_coords = get_instrument_coordinates('nantucket', 'z03_lidar')
@@ -114,7 +103,7 @@ def parse_profiling_rtd_file(filepath, verbose=False):
             for line_num, line in enumerate(lines[42:], start=43):
                 parts = line.strip().split()
                 # Some rows have date and time in separate whitespace tokens
-                # —> re-merge them so column count stays stable.
+                # Re-merge them so the column count stays stable.
                 if len(parts) > 1 and '/' in parts[0] and ':' in parts[1]:
                     parts = [f"{parts[0]} {parts[1]}"] + parts[2:]
                 parsed_lines.append(parts)
@@ -130,8 +119,7 @@ def parse_profiling_rtd_file(filepath, verbose=False):
             print(f"Loaded data shape: {data.shape}")
             print(f"First few columns sample: {data.iloc[0, :10].tolist()}")
 
-        # Each height contributes 8 columns in fixed order — generate the
-        # full column name list dynamically from the parsed height list.
+        # Each height contributes 8 columns in fixed order.
         column_names = ['timestamp', 'position', 'temperature', 'wiper']
         for h in range(len(heights)):
             column_names.extend([
@@ -146,7 +134,7 @@ def parse_profiling_rtd_file(filepath, verbose=False):
 
         data.columns = column_names[:len(data.columns)]
 
-        # Try several timestamp formats — different firmware revisions use different separators.
+        # Try several timestamp formats: firmware revisions differ in separators.
         timestamp_formats = [
             '%Y/%m/%d %H:%M:%S.%f',
             '%Y-%m-%d %H:%M:%S.%f',
@@ -178,8 +166,7 @@ def parse_profiling_rtd_file(filepath, verbose=False):
             'file_type': 'rtd'
         }
 
-        # Pivot the per-height columns into a {height: {var: series}} dict
-        # to match the structure used by every other parser downstream.
+        # Pivot to {height: {var: series}}, the shape every parser returns.
         for i, height in enumerate(heights):
             try:
                 result['measurements'][height] = {
@@ -209,15 +196,12 @@ def parse_profiling_rtd_file(filepath, verbose=False):
 
 def parse_profiling_sta_file(filepath, verbose=True):
     """
-    Parse a Leosphere STA file (Block Island z03). Unlike the RTD format,
-    STA files contain pre-computed wind statistics and per-height std
-    devs, so the downstream pipeline does ~not~ need to re-derive them.
+    Parse a Leosphere STA file (Block Island z03). STA carries pre-computed
+    wind statistics and per-height standard deviations.
 
-    The data table is variable-length: header keys mark the boundary, and
-    each altitude contributes 18 columns whose layout is documented inline
-    below. STA files use engineering coordinates (U south-positive, V
-    west-positive, W down-positive); the reorientation to meteorological
-    convention happens downstream.
+    The ``*_native`` variables are in the instrument's engineering frame: U
+    south-positive, V west-positive, W down-positive. Reorientation to
+    meteorological convention happens downstream.
 
     Returns
     -------
@@ -237,8 +221,6 @@ def parse_profiling_sta_file(filepath, verbose=True):
     gps_coords = None
     data_start = None
 
-    # Step through the header until we find the altitudes line, the GPS line,
-    # and the marker line that precedes the data table.
     for i, line in enumerate(lines):
         line_stripped = line.strip()
         if line_stripped.startswith('Altitudes(m)='):
@@ -297,7 +279,6 @@ def parse_profiling_sta_file(filepath, verbose=True):
 
                 measurements[alt]['vhm'].append(_safe_float(parts[base_idx + 0]))
                 measurements[alt]['std_vhm'].append(_safe_float(parts[base_idx + 1]))
-                # Skip VhMax(2), VhMin(3), Azim(4) — not used downstream
                 measurements[alt]['u_native'].append(_safe_float(parts[base_idx + 5]))
                 measurements[alt]['std_u_native'].append(_safe_float(parts[base_idx + 6]))
                 measurements[alt]['v_native'].append(_safe_float(parts[base_idx + 7]))
@@ -305,7 +286,6 @@ def parse_profiling_sta_file(filepath, verbose=True):
                 measurements[alt]['w_native'].append(_safe_float(parts[base_idx + 9]))
                 measurements[alt]['std_w_native'].append(_safe_float(parts[base_idx + 10]))
                 measurements[alt]['cnr'].append(_safe_float(parts[base_idx + 11]))
-                # Skip dCNR(12), CNRmax(13), CNRmin(14), spectral_broadening(15-16)
                 measurements[alt]['availability'].append(_safe_float(parts[base_idx + 17]))
 
         except Exception as e:
@@ -328,10 +308,8 @@ def parse_profiling_sta_file(filepath, verbose=True):
 
 def parse_profiling_csv_file(filepath, verbose=False):
     """
-    Parse a Rhode Island z03 CSV. These contain pre-computed wind
-    statistics (one column per height per variable) and a single
-    metadata row at line 0 from which the height list and GPS are
-    extracted.
+    Parse a Rhode Island z03 CSV. Columns hold pre-computed wind statistics,
+    one column per height per variable.
     """
     if verbose:
         print(f"Parsing Z03 CSV file: {filepath}")
@@ -353,8 +331,7 @@ def parse_profiling_csv_file(filepath, verbose=False):
         except (ValueError, AttributeError):
             lat, lon = None, None
 
-        # Heights are listed in the metadata line (row 0) which we
-        # skipped above — re-read it directly.
+        # Heights live in the metadata line that read_csv skipped.
         with open(filepath, 'r') as f:
             metadata_line = f.readline().strip()
 
@@ -373,8 +350,6 @@ def parse_profiling_csv_file(filepath, verbose=False):
         measurements = {}
 
         for height in heights:
-            # Column names are templated by integer height — each variable
-            # has its own column for each measurement level.
             height_cols = {
                 'wind_speed': f'Horizontal Wind Speed (m/s) at {int(height)}m',
                 'wind_direction': f'Wind Direction (deg) at {int(height)}m',
@@ -419,7 +394,7 @@ def parse_profiling_csv_file(filepath, verbose=False):
 def _parse_gps_coordinates(gps_string):
     """
     Parse the STA-header GPS string into decimal lat/lon. The format is
-    DDMM'SS.SS"N DDMM'SS.SS"W ALTm — note that the degree symbol is
+    DDMM'SS.SS"N DDMM'SS.SS"W ALTm. Note that the degree symbol is
     missing from the source, so degrees and minutes are concatenated in
     the first integer group.
     """
@@ -429,8 +404,7 @@ def _parse_gps_coordinates(gps_string):
     if not match:
         return None
 
-    # The first capture group is the concatenated degrees+minutes
-    # (e.g. "4110" = 41° 10'). Last two characters are minutes.
+    # "4110" is 41 deg 10 min: the last two characters are the minutes.
     lat_full = match.group(1)
     if len(lat_full) >= 3:
         lat_deg = float(lat_full[:-2])
@@ -481,13 +455,17 @@ _caco_file_cache = {}
 
 def parse_caco_lidar_file(filepath, use_cache=True):
     """
-    Parse a CACO z01 Excel file (Windcube-v2-96 native export) into the
-    same shape every other lidar parser produces, so downstream code
-    doesn't need a CACO branch.
+    Parse a CACO z01 Excel file (Windcube-v2-96 native export) into the shape
+    every other lidar parser returns.
 
-    The Excel layout has the height list on row 39 and column headers on
-    row 41 (data starts at 42). Per-height columns are named with the
-    integer altitude in the column label, e.g. ``"100m Wind Speed (m/s)"``.
+    Layout: heights on row 39, column headers on row 41, data from row 42.
+    Per-height columns carry the integer altitude, e.g. "100m Wind Speed (m/s)".
+
+    ``Wind Speed Dispersion`` is the vendor's within-window sigma(WS) and the
+    only turbulence quantity read here. ``Z-wind Dispersion`` is not read: it is
+    the vertical beam's radial-velocity standard deviation, not the VAD-fit
+    sigma_w the rest of the pipeline reports, so mixing the two would break the
+    TKE definition.
     """
 
     if use_cache and filepath in _caco_file_cache:
@@ -497,7 +475,6 @@ def parse_caco_lidar_file(filepath, use_cache=True):
     df = df.rename(columns={df.columns[0]: 'timestamp'})
     df['timestamp'] = pd.to_datetime(df['timestamp'])
 
-    # Re-read the top of the file to pick up the heights row
     header_df = pd.read_excel(filepath, sheet_name='Sheet1', header=None, nrows=40)
     altitudes_row = header_df.iloc[39]
     heights = []
@@ -505,7 +482,7 @@ def parse_caco_lidar_file(filepath, use_cache=True):
         if pd.notna(val) and str(val).replace('.', '').isdigit():
             heights.append(int(float(val)))
 
-    # CACO Excel headers don't always carry GPS — fall back to known coords (config)
+    # CACO Excel headers carry no GPS; these are the surveyed site coordinates.
     latitude, longitude = 42.0324, -70.0535
 
     measurements = {}
@@ -514,6 +491,7 @@ def parse_caco_lidar_file(filepath, use_cache=True):
         wind_speed_col = f'{height}m Wind Speed (m/s)'
         wind_dir_col = f'{height}m Wind Direction (°)'
         vertical_wind_col = f'{height}m Z-wind (m/s)'
+        ws_dispersion_col = f'{height}m Wind Speed Dispersion (m/s)'
         cnr_col = f'{height}m CNR (dB)'
         availability_col = f'{height}m Data Availability (%)'
 
@@ -521,6 +499,7 @@ def parse_caco_lidar_file(filepath, use_cache=True):
             'wind_speed': np.full(len(df), np.nan),
             'wind_direction': np.full(len(df), np.nan),
             'w': np.full(len(df), np.nan),
+            'ws_dispersion': np.full(len(df), np.nan),
             'cnr': np.full(len(df), np.nan),
             'availability': np.full(len(df), np.nan)
         }
@@ -531,6 +510,8 @@ def parse_caco_lidar_file(filepath, use_cache=True):
             measurements[height]['wind_direction'] = pd.to_numeric(df[wind_dir_col], errors='coerce').values
         if vertical_wind_col in df.columns:
             measurements[height]['w'] = pd.to_numeric(df[vertical_wind_col], errors='coerce').values
+        if ws_dispersion_col in df.columns:
+            measurements[height]['ws_dispersion'] = pd.to_numeric(df[ws_dispersion_col], errors='coerce').values
         if cnr_col in df.columns:
             measurements[height]['cnr'] = pd.to_numeric(df[cnr_col], errors='coerce').values
         if availability_col in df.columns:

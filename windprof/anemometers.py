@@ -1,10 +1,10 @@
 """Sonic anemometer and surface meteorological station processing
 
-Sonic anemometers provide the only direct (non-remote-sensing) wind and
-turbulence measurements in the merged product, and contribute below the
-minimum range of lidars and radar (typically 5-10 m AGL). Reynolds
-decomposition is applied to the high-rate (10-20 Hz) record to derive
-10-minute mean (u, v, w) and component variances.
+Sonics are the only direct (non-remote-sensing) wind and turbulence
+measurements in the merged product, and the only source below the minimum
+range of the lidars and radar (typically 5-10 m AGL). Reynolds decomposition
+of the high-rate (10-20 Hz) record gives 10-minute mean (u, v, w) and
+component variances.
 
 Entry points by file format encountered in WFIP3:
 
@@ -17,11 +17,8 @@ Entry points by file format encountered in WFIP3:
   - ``extract_wind_from_surface_met``: low-rate surface met wind extraction
     for sites without true sonic anemometers (Block Island only).
 
-Sonic file formats varied across the WFIP3 sites; supporting a new
-sonic format requires adding a new reader and dispatching from 
-``process_anemometer_time_series``. Tower heights and per-instrument anemometer
-corrections are config-driven via ``LOCATION_CONFIG[site]['anemometer_heights']`` 
-and ``['anemometer_corrections']``.
+Tower heights and per-instrument anemometer corrections are config-driven via
+``LOCATION_CONFIG[site]['anemometer_heights']`` and ``['anemometer_corrections']``.
 """
 
 import numpy as np
@@ -43,7 +40,7 @@ def process_sonic_anemometer(filename, start_time, location, time_window=TIME_WI
     high-rate sonic anemometer data (NetCDF, hourly files).
 
     Pass ``open_dataset`` when iterating multiple windows in the same hour
-    so the file is only opened once — see ``process_anemometer_time_series``.
+    so the file is only opened once. See ``process_anemometer_time_series``.
 
     Parameters
     ----------
@@ -74,8 +71,7 @@ def process_sonic_anemometer(filename, start_time, location, time_window=TIME_WI
         return ~np.isnan(combined).any(axis=1)
 
     def apply_coordinate_correction(u_series, v_series, correction_deg):
-        # Standard 2D rotation of (u, v) about the vertical to align the
-        # instrument frame with true north.
+        # Rotates (u, v) from the instrument frame into true north.
         if correction_deg == 0:
             return u_series, v_series
 
@@ -96,12 +92,6 @@ def process_sonic_anemometer(filename, start_time, location, time_window=TIME_WI
             date_str = start_time.strftime('%Y%m%d')
             hour_str = start_time.strftime('%H0000')
 
-            # Hourly NetCDF naming convention is site-specific; the patterns
-            # below cover the WFIP3 sites that delivered sonic data in this
-            # format. For other sites in WFIP3 (Cape Cod, Narragansett),
-            # different ingestion paths are used (see ``process_sonic_c1_csv``
-            # and ``process_rhod_sonic_csv``). To adapt for a new sonic file 
-            # naming convention, add a branch here following the same pattern.
             if location in ['nantucket', 'nant']:
                 hourly_filename = f"{directory}/nant.met.{instrument}.a0.{date_str}.{hour_str}.nc"
             elif location in ['block_island', 'bloc']:
@@ -168,8 +158,6 @@ def process_sonic_anemometer(filename, start_time, location, time_window=TIME_WI
 
         ground_elevation = get_ground_elevation_from_config(location, f'{instrument}_met')
 
-        # Measurement height (AGL) from config, defaulting to 10 m if absent.
-        # Heights are defined in LOCATION_CONFIG[location]['anemometer_heights'].
         measurement_height_agl = (
             LOCATION_CONFIG.get(location, {})
             .get('anemometer_heights', {})
@@ -234,16 +222,14 @@ def process_sonic_anemometer(filename, start_time, location, time_window=TIME_WI
 def process_sonic_c1_csv(filename, start_time, location, time_window=TIME_WINDOW_MINUTES,
                         instrument='z01', ground_elevation=None, verbose=False):
     """
-    Read one 10-minute averaged record from a .c1 CSV (Rhode Island and
-    Cape Cod sonic ingest). CSV timestamps mark the END of the averaging
-    period, so we shift them back by 10 minutes before matching against
-    ``start_time``.
+    Read one 10-minute averaged record from a .c1 CSV (Cape Cod sonic
+    ingest). CSV timestamps mark the END of the averaging period, so we
+    shift them back by 10 minutes before matching against ``start_time``.
     """
     try:
         df = pd.read_csv(filename)
 
-        # The first two rows are variable names and units; promote row 0
-        # to column header and drop both header rows from the data.
+        # Row 0 holds variable names, row 1 holds units.
         variable_names = df.iloc[0].values
         df.columns = variable_names
         df = df.iloc[2:].reset_index(drop=True)
@@ -255,8 +241,7 @@ def process_sonic_c1_csv(filename, start_time, location, time_window=TIME_WINDOW
         time_diffs = abs(df['period_start'] - target_time)
         closest_idx = time_diffs.idxmin()
 
-        # Tolerance is half the window length — anything farther means
-        # the file doesn't sufficiently cover this interval.
+        # Tolerance is half the window length.
         if time_diffs.iloc[closest_idx] > pd.Timedelta(minutes=5):
             if verbose:
                 print(f"No data within 5 minutes of {start_time}")
@@ -276,6 +261,18 @@ def process_sonic_c1_csv(filename, start_time, location, time_window=TIME_WINDOW
         wind_dir = safe_numeric(row['wind_dir'])
         w_vertical = safe_numeric(row['w_unrot'])
         tke = safe_numeric(row['TKE'])
+        u_var = safe_numeric(row.get('u_var'))
+        v_var = safe_numeric(row.get('v_var'))
+        w_var = safe_numeric(row.get('w_var'))
+
+        std_u = np.sqrt(u_var) if not np.isnan(u_var) and u_var >= 0 else np.nan
+        std_v = np.sqrt(v_var) if not np.isnan(v_var) and v_var >= 0 else np.nan
+        std_w = np.sqrt(w_var) if not np.isnan(w_var) and w_var >= 0 else np.nan
+
+        if not np.isnan(wind_speed) and wind_speed > 0 and not np.isnan(std_u):
+            turbulence_intensity = std_u / wind_speed
+        else:
+            turbulence_intensity = np.nan
 
         if np.isnan(wind_speed) or np.isnan(wind_dir):
             if verbose:
@@ -321,10 +318,21 @@ def process_sonic_c1_csv(filename, start_time, location, time_window=TIME_WINDOW
             'longitude': coords[1]
         }
 
+        turb_data = {}
+        if not np.isnan(turbulence_intensity):
+            turb_data['ti'] = turbulence_intensity
         if not np.isnan(tke):
-            tke_data = {'tke': tke}
-            if not apply_physics_based_qc(tke_data):
-                results['turbulence_profiles'][measurement_height_agl] = round_profile_values(tke_data)
+            turb_data['tke'] = tke
+        if not np.isnan(std_u):
+            turb_data['std_u'] = std_u
+        if not np.isnan(std_v):
+            turb_data['std_v'] = std_v
+        if not np.isnan(std_w):
+            turb_data['std_w'] = std_w
+
+        if turb_data:
+            if not apply_physics_based_qc(turb_data):
+                results['turbulence_profiles'][measurement_height_agl] = round_profile_values(turb_data)
 
         if verbose:
             print(f"C1 {instrument}: WS={wind_speed:.2f} m/s, WD={wind_dir:.1f}°, TKE={tke:.3f}")
@@ -400,8 +408,6 @@ def process_rhod_sonic_csv(filename, start_time, location, time_window=TIME_WIND
         v_var = safe_numeric(row.get('v_var'))
         w_var = safe_numeric(row.get('w_var'))
 
-        # Variances can be tiny-negative due to rounding in the source CSV;
-        # guard against sqrt of negative before propagating to σ.
         std_u = np.sqrt(u_var) if not np.isnan(u_var) and u_var >= 0 else np.nan
         std_v = np.sqrt(v_var) if not np.isnan(v_var) and v_var >= 0 else np.nan
         std_w = np.sqrt(w_var) if not np.isnan(w_var) and w_var >= 0 else np.nan
@@ -479,11 +485,8 @@ def process_rhod_sonic_csv(filename, start_time, location, time_window=TIME_WIND
 def extract_wind_from_surface_met(surface_met_data, location='block_island'):
     """
     Lift surface-met wind records into the standard profile dict format.
-    Block Island only — at the other sites the surface met record is not
-    used as a profile input.
-
-    The reported height is shifted up by ``tower_height`` so the surface
-    met point sits at its true AGL altitude in the merged profile.
+    Block Island only: at the other sites the surface met record is not used
+    as a profile input.
     """
 
     if location not in ['block_island', 'bloc']:
@@ -497,23 +500,13 @@ def extract_wind_from_surface_met(surface_met_data, location='block_island'):
 
     ground_elevation_asl = get_ground_elevation_from_config(location, 'surf_met')
 
-    config = LOCATION_CONFIG.get(location, {})
-    # 10 m surface met tower per NOAA PSL spec
-    # (https://psl.noaa.gov/data/obs/instruments/SurfaceMetDescription.html)
-    tower_height = config.get('anemometer_heights', {}).get('surf_met', 10.0)
-
     wind_results = []
     for unix_time, data in surface_met_data.items():
         if 'wind_profile' in data:
-            adjusted_wind_profiles = {}
-            for height_agl, wind_data in data['wind_profile'].items():
-                actual_height_agl = height_agl + tower_height
-                adjusted_wind_profiles[actual_height_agl] = wind_data
-
             wind_result = {
                 'time': pd.to_datetime(unix_time, unit='s'),
                 'instrument_code': 'met_z01',
-                'wind_profiles': adjusted_wind_profiles,
+                'wind_profiles': dict(data['wind_profile']),
                 'turbulence_profiles': {},
                 'ground_elevation': ground_elevation_asl,
                 'latitude': lat,
@@ -532,15 +525,8 @@ def process_anemometer_time_series(filename, start_time, end_time, location,
 
     Used for the Nantucket and Block Island sonic file convention (hourly
     NetCDF files at native 10-20 Hz sampling). Windows are grouped by hour
-    so each hourly NetCDF file is opened exactly once, which is ~10x
-    faster than calling ``process_sonic_anemometer`` per window because
-    ``xarray.open_dataset`` dominates otherwise.
-
-    For the Cape Cod / CACO C1 CSV format, use ``process_sonic_c1_time_series``.
-    For the Narragansett / RHOD EddyPro CSV format, use
-    ``process_rhod_sonic_time_series``. Sonic file formats vary by site;
-    extending WINDPROF to a new sonic format likely requires adding a new reader
-    in ``anemometers.py``.
+    so each hourly file is opened only once; ``xarray.open_dataset``
+    otherwise dominates the runtime.
 
     Parameters
     ----------
@@ -562,8 +548,7 @@ def process_anemometer_time_series(filename, start_time, end_time, location,
     list of dict
         One profile dict per successfully processed window.
     """
-    # Snap to the start of the containing window, e.g. 12:03 --> 12:00
-    # for a 10-minute window.
+    # Snap to the start of the containing window, e.g. 12:03 -> 12:00.
     current_time = start_time.replace(minute=(start_time.minute // TIME_WINDOW_MINUTES) * TIME_WINDOW_MINUTES, second=0, microsecond=0)
     hourly_groups = {}
 

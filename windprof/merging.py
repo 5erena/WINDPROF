@@ -1,22 +1,12 @@
 """Hierarchical cross-instrument merging into best-estimate profiles
 
-For each 10-minute window, individual instrument profiles are
-interpolated to a common height grid (``interpolate_profiles_to_grid``)
-and then combined with a height-dependent priority:
+Each 10-minute window's instrument profiles are interpolated to a common
+height grid and then combined by height:
 
-  - **Below ~5-20 m AGL** (sub-lidar range): sonic anemometers only.
-  - **Below 1000 m AGL**: lidars take priority; radar contributes only
-    where no lidar measurement exists at that height.
-  - **Above 1000 m AGL**: all available instruments (radar + lidar) 
-    are linearly averaged.
-
-Where multiple instruments contribute at the same height, their values
-are averaged (with circular vector averaging for direction). The merged
-value, an inter-instrument spread estimate, the contributing instrument
-identifiers, and per-height data-availability fractions are stored.
-
-Inter-instrument agreement quality flags are assigned via
-``quality_control.calculate_quality_flag_for_height`` during the merge.
+  - Below the lowest lidar gate (~5-20 m AGL): sonic anemometers only.
+  - Below 1000 m AGL: lidars take priority, radar fills only heights with
+    no lidar measurement.
+  - Above 1000 m AGL: radar and lidar are averaged.
 
 This module embeds the WFIP3-specific instrument hierarchy directly in
 the merge logic; campaigns with different instrument inventories may
@@ -32,16 +22,12 @@ from datetime import timedelta
 from pathlib import Path
 from .config import (round_profile_values, wind_direction_average, normalize_location,
                      MALFUNCTION_PERIODS, get_surface_met_patterns, LOCATION_CONFIG,
-                     TIME_WINDOW_MINUTES)
+                     TIME_WINDOW_MINUTES, get_near_surface_levels)
 from .quality_control import calculate_quality_flag_for_height
 from .lidars import process_lidar_time_series
 from .radars import process_radar_time_series, process_radar_netcdf_time_series
 from .anemometers import (process_anemometer_time_series, process_sonic_c1_time_series,
                           process_rhod_sonic_time_series, extract_wind_from_surface_met)
-
-### Interpolation and Merging
-
-#### Profile Interpolation
 
 def interpolate_profiles_to_grid(profiles, target_heights, profile_type, max_gap=200):
     """
@@ -65,8 +51,12 @@ def interpolate_profiles_to_grid(profiles, target_heights, profile_type, max_gap
     if not profiles:
         return {}
 
-    # Single-height instruments (sonics): snap to the nearest grid level
-    # within 10 m rather than attempting interpolation.
+    # A non-finite height cannot be placed on any grid.
+    profiles = {h: v for h, v in profiles.items() if np.isfinite(h)}
+    if not profiles:
+        return {}
+
+    # Single-height instruments (sonics): snap to the nearest grid level within 10 m.
     if len(profiles) == 1:
         single_height = list(profiles.keys())[0]
         distances = np.abs(target_heights - single_height)
@@ -78,7 +68,6 @@ def interpolate_profiles_to_grid(profiles, target_heights, profile_type, max_gap
     original_heights = np.array(sorted(profiles.keys()))
     interpolated_profile = {}
     
-    # Parameters to interpolate
     if profile_type == 'wind':
         params = ['ws', 'w', 'uerr', 'verr', 'werr', 'wserr', 'wderr']
     else:
@@ -98,14 +87,12 @@ def interpolate_profiles_to_grid(profiles, target_heights, profile_type, max_gap
         
         segment_min, segment_max = segment_heights[0], segment_heights[-1]
         
-        # Vectorized target selection 
         segment_mask = (target_heights >= segment_min) & (target_heights <= segment_max)
         segment_targets = target_heights[segment_mask]
         
         if len(segment_targets) == 0:
             continue
         
-        # Vectorized parameter interpolation 
         for param in params:
             segment_values = np.array([profiles[h].get(param, np.nan) for h in segment_heights])
             valid_mask = ~np.isnan(segment_values)
@@ -146,15 +133,12 @@ def interpolate_profiles_to_grid(profiles, target_heights, profile_type, max_gap
                 valid_wd = segment_wd[valid_mask]
 
                 try:
-                    # Circular interpolation: decompose to sin/cos then recombine via
-                    # atan2 to avoid the 0/360 wraparound discontinuity.
                     sin_values = np.sin(np.deg2rad(valid_wd))
                     cos_values = np.cos(np.deg2rad(valid_wd))
                     
                     interp_sin = np.interp(segment_targets, valid_heights, sin_values)
                     interp_cos = np.interp(segment_targets, valid_heights, cos_values)
                     
-                    # Vectorized angle calculation and conversion back to degrees
                     interp_wd = np.rad2deg(np.arctan2(interp_sin, interp_cos)) % 360
                     
                     for height, wd_value in zip(segment_targets, interp_wd):
@@ -164,13 +148,10 @@ def interpolate_profiles_to_grid(profiles, target_heights, profile_type, max_gap
                 except (ValueError, TypeError):
                     pass
     
-    # Bulk rounding after all interpolation is done
     for height in interpolated_profile:
         interpolated_profile[height] = round_profile_values(interpolated_profile[height])
     
     return interpolated_profile
-
-#### Multi-Instrument Merging
 
 def extract_availability_data(instruments_data):
     """Collect per-instrument availability dicts from the results, if present"""
@@ -205,7 +186,6 @@ def average_multi_instrument_profiles(interpolated_data, target_heights, paramet
         {'profiles': merged_profiles, 'flags': quality_flags}
     """    
     
-    # Check if we're in a malfunction period
     in_malfunction = False
     if location in MALFUNCTION_PERIODS and time_interval is not None:
         if isinstance(time_interval, int):
@@ -228,7 +208,6 @@ def average_multi_instrument_profiles(interpolated_data, target_heights, paramet
     for height in target_heights:
         height_values = {}
         
-        # Determine which instruments to use based on height
         if height < 1000:
             lidar_has_data = any(
                 height in interpolated_data[inst] and 
@@ -247,7 +226,6 @@ def average_multi_instrument_profiles(interpolated_data, target_heights, paramet
         else:
             instruments_to_use = all_instruments
         
-        # Exclude radar during malfunction periods
         if in_malfunction and 'radar' in instruments_to_use:
             instruments_to_use = [inst for inst in instruments_to_use if inst != 'radar']
         
@@ -275,7 +253,10 @@ def average_multi_instrument_profiles(interpolated_data, target_heights, paramet
                     merged_profiles[height][param] = round(merged_value, decimals)
             
             merged_profiles[height] = round_profile_values(merged_profiles[height])
-            height_flags = calculate_quality_flag_for_height(height, interpolated_data, parameters)
+            # Flags cover only the instruments that formed the merged value, so an
+            # excluded instrument cannot mark a cell it did not contribute to.
+            used_data = {inst: interpolated_data[inst] for inst in instruments_to_use}
+            height_flags = calculate_quality_flag_for_height(height, used_data, parameters)
             quality_flags[height] = height_flags
     
     return {'profiles': merged_profiles, 'flags': quality_flags}
@@ -312,25 +293,29 @@ def create_combined_results(time_interval, instruments_data, include_availabilit
         if result.get('ground_elevation'):
             ground_elevations.append(result['ground_elevation'])
     
+    # A non-finite height would make max_height NaN and break the grid below.
+    all_heights_list = [h for h in all_heights_list if np.isfinite(h)]
     if not all_heights_list:
         return None
-    
+
     avg_ground_elevation = np.mean(ground_elevations) if ground_elevations else 0
     max_height = max(all_heights_list)
     
-    # Target height grid: 20 m spacing in the surface layer (0-100 m) where
-    # sonic/met towers and lidars resolve fine gradients, 30 m spacing aloft matching the
-    # native lidar/radar range gate resolution.
-    heights_below_100m = np.arange(0, 100, 20)
-    heights_above_100m = np.arange(100, max_height + 30, 30)
+    # Grid: the anemometer measurement heights first (config anemometer_heights)
+    # so each single-height sonic sits exactly where it measured, then 20 m
+    # spacing through the surface layer and 30 m aloft, matching the native
+    # lidar and radar range-gate resolution.
+    heights_below_100m = np.concatenate([
+        np.array(get_near_surface_levels(), dtype=float),
+        np.arange(20.0, 100.0, 20.0)
+    ])
+    heights_above_100m = np.arange(100.0, max_height + 30, 30.0)
     target_heights = np.concatenate([heights_below_100m, heights_above_100m])
 
-    # Interpolate each instrument to target grid
     interpolated_wind = {}
     interpolated_turbulence = {}
     for instrument_name, result in instruments_data.items():
 
-        # Interpolate wind profiles
         if result.get('wind_profiles'):
             wind_interp = interpolate_profiles_to_grid(
                 result['wind_profiles'], target_heights, 'wind', max_gap=max_gap
@@ -338,7 +323,6 @@ def create_combined_results(time_interval, instruments_data, include_availabilit
             if wind_interp:
                 interpolated_wind[instrument_name] = wind_interp
 
-        # Interpolate turbulence profiles
         if result.get('turbulence_profiles'):
             turb_interp = interpolate_profiles_to_grid(
                 result['turbulence_profiles'], target_heights, 'turbulence', max_gap=max_gap
@@ -347,7 +331,6 @@ def create_combined_results(time_interval, instruments_data, include_availabilit
                 interpolated_turbulence[instrument_name] = turb_interp
      
 
-    # Merge profiles and assign quality flags
     merged_wind = average_multi_instrument_profiles(
         interpolated_wind, target_heights, ['ws', 'wd', 'w'],
         location=location,          
@@ -359,7 +342,6 @@ def create_combined_results(time_interval, instruments_data, include_availabilit
         time_interval=time_interval  
     )
 
-    # Create combined time interval
     combined_interval = {
         'time': int(time_interval.timestamp()),
         'ground_elevation': avg_ground_elevation,
@@ -377,11 +359,9 @@ def create_combined_results(time_interval, instruments_data, include_availabilit
         }
     }
 
-    # Add availability data if requested
     if include_availability:
         combined_interval['availability'] = extract_availability_data(instruments_data)
 
-    # Aggregate filtering summaries from individual instruments
     total_heights_available = 0
     total_heights_included = 0
     total_heights_excluded = 0
@@ -395,7 +375,6 @@ def create_combined_results(time_interval, instruments_data, include_availabilit
             total_heights_excluded += fs['heights_excluded']
             instrument_summaries[instrument_name] = fs
     
-    # Create aggregated filtering summary
     retention_rate = total_heights_included / total_heights_available if total_heights_available > 0 else 0
     
     combined_interval['filtering_summary'] = {
@@ -412,7 +391,6 @@ def merge_all_instruments_and_times(all_results, include_availability, location=
     """Index all per-instrument result lists by timestamp, then call
     create_combined_results for each time step to produce the merged product.
     """
-    # Create time-indexed dictionary for easy lookup
     all_data_by_time = {}
 
     for instrument_name, results_list in all_results.items():
@@ -426,7 +404,6 @@ def merge_all_instruments_and_times(all_results, include_availability, location=
                 
             all_data_by_time[time_interval][instrument_name] = result
 
-    # Process each time interval 
     combined_intervals = []
 
     for time_interval in sorted(all_data_by_time.keys()):
@@ -448,8 +425,6 @@ def merge_all_instruments_and_times(all_results, include_availability, location=
         }
     }
 
-#### Main Processing
-
 def convert_radar_results_to_combined_format(radar_results):
     """Reformat radar results to match the combined dict structure used by
     merge_all_instruments_and_times. Radar has no turbulence data, so
@@ -461,7 +436,7 @@ def convert_radar_results_to_combined_format(radar_results):
             'time': result['time'],
             'instrument_code': result.get('instrument_code', 'radar'),
             'wind_profiles': result.get('profiles', {}),
-            'turbulence_profiles': {},  # Radar has no turbulence data
+            'turbulence_profiles': {},
             'ground_elevation': result.get('ground_elevation'),
             'latitude': result.get('latitude'),
             'longitude': result.get('longitude')
@@ -473,7 +448,6 @@ def finalize_combined_results(combined_results):
     """Attach processing metadata (coordinate system, QC flag legend, surface
     met units) to the combined results dict before NetCDF export.
     """
-    # Add processing metadata
     final_results = combined_results.copy()
     
     final_results['processing_info'] = {
@@ -530,7 +504,6 @@ def process_combined_profiles(instrument_configs, start_time, end_time,
         Combined results with wind and turbulence profiles
     """
     location = normalize_location(location)
-    # Convert times
     if isinstance(start_time, str):
         start_time = pd.to_datetime(start_time)
     if isinstance(end_time, str):
@@ -538,7 +511,6 @@ def process_combined_profiles(instrument_configs, start_time, end_time,
     print(f"Processing combined wind and turbulence profiles from {start_time} to {end_time}")
     print(f"Location: {location}")
     
-    # Process all instruments (excluding surface_met initially)
     all_results = {}
     surface_met_config = None
     for instrument_name, config in instrument_configs.items():
@@ -549,7 +521,6 @@ def process_combined_profiles(instrument_configs, start_time, end_time,
         filename = config['filename']
         instrument_params = config.get('params', {})
         try:
-            # Route to appropriate processor
             if instrument_name.startswith('lidar_'):
                 instrument_code = instrument_name.split('_')[1]
                 instrument_params['availability_threshold'] = availability_threshold
@@ -561,9 +532,7 @@ def process_combined_profiles(instrument_configs, start_time, end_time,
             elif instrument_name.startswith('met_'):
                 instrument_code = instrument_name.split('_')[1]
                 
-                # Route based on location
                 if location == 'cape_cod':
-                    # Cape Cod uses .c1 CSV format
                     results = process_sonic_c1_time_series(
                         filename, start_time, end_time, location,
                         instrument=instrument_code, verbose=verbose, **instrument_params
@@ -575,7 +544,6 @@ def process_combined_profiles(instrument_configs, start_time, end_time,
                         instrument=instrument_code, verbose=verbose, **instrument_params
                     )
                 else:
-                    # Standard anemometer processing for Nantucket/Block Island
                     instrument_params['instrument'] = instrument_code 
                     results = process_anemometer_time_series(
                         filename, start_time, end_time, location,
@@ -583,9 +551,8 @@ def process_combined_profiles(instrument_configs, start_time, end_time,
                     )
 
             elif instrument_name == 'radar':
-                # Route to appropriate radar processor based on location
                 if location == 'rhode_island':
-                    # Rhode Island uses NetCDF format - ensure filename is a list
+                    # Rhode Island radar is NetCDF.
                     if isinstance(filename, str):
                         filenames = [filename]
                     else:
@@ -596,7 +563,6 @@ def process_combined_profiles(instrument_configs, start_time, end_time,
                         verbose=verbose, **instrument_params
                     )
                     
-                    # Convert to combined format
                     results = convert_radar_results_to_combined_format(results)
                     
                 else:
@@ -618,7 +584,6 @@ def process_combined_profiles(instrument_configs, start_time, end_time,
             print(f"Error processing {instrument_name}: {e}")
             continue
         
-    # Process surface met data if available
     surface_met_data = {}
     if surface_met_config:
         print(f"\nProcessing surface meteorological data...")
@@ -635,7 +600,6 @@ def process_combined_profiles(instrument_configs, start_time, end_time,
             )
             print(f"Successfully processed {len(surface_met_data)} surface met time windows")
             
-            # Extract wind profiles from surface met for Block Island
             if location == 'block_island':
                 wind_from_surface = extract_wind_from_surface_met(surface_met_data, location)
                 if wind_from_surface:
@@ -656,14 +620,12 @@ def process_combined_profiles(instrument_configs, start_time, end_time,
         all_results, include_availability, location=location
     )
     
-    # Distribute surface met data into individual time intervals
     if surface_met_data:
         print(f"Distributing surface met data into {len(combined_results.get('time_intervals', []))} time intervals...")
         for interval in combined_results.get('time_intervals', []):
-            interval_unix_time = interval['time']  # should be unix timestamp
-            # Nearest-neighbor match within ±5 min (300 s): surface met windows
-            # and profile intervals are both TIME_WINDOW_MINUTES long, so this
-            # tolerance absorbs clock skew without risking a cross-window match.
+            interval_unix_time = interval['time']
+            # Nearest match within 300 s: both window kinds are TIME_WINDOW_MINUTES
+            # long, so this absorbs clock skew without a cross-window match.
             best_match = None
             min_time_diff = float('inf')
 
@@ -672,7 +634,6 @@ def process_combined_profiles(instrument_configs, start_time, end_time,
                 if time_diff < min_time_diff and time_diff <= 300:
                     min_time_diff = time_diff
                     best_match = surf_data
-            # Add surface met data to interval
             if best_match:
                 interval['surface_met'] = {
                     'pressure': best_match['pressure'],
@@ -681,7 +642,6 @@ def process_combined_profiles(instrument_configs, start_time, end_time,
                     'precipitation': best_match['precipitation']
                 }
             else:
-                # Add NaN values if no match found
                 interval['surface_met'] = {
                     'pressure': np.nan,
                     'temperature': np.nan,
@@ -698,6 +658,135 @@ def process_combined_profiles(instrument_configs, start_time, end_time,
     print(f"\nSuccessfully processed {len(final_results.get('time_intervals', []))} combined time intervals")
     return final_results
 
+RAIN_COUNTER_MAX_GAP_S = 600
+RAIN_COUNTER_SPIKE_MM = 0.5
+
+# Cape Cod WXT536 screen: (measurement range, single-reading jump). The ranges
+# are the sensor's specified measurement ranges; a jump larger than this between
+# neighboring readings seconds apart is not a change in the air.
+CACO_WXT_SCREEN = {
+    'pressure': ((600.0, 1100.0), 2.0),
+    'temperature': ((-52.0, 60.0), 2.0),
+    'relative_humidity': ((0.0, 100.0), 5.0),
+}
+SURFACE_SPIKE_MAX_GAP_S = 120
+
+
+def single_reading_spikes(seconds, values, threshold, max_gap_s, require_agreement=False):
+    """
+    Flag readings that differ from both of their neighbors, in the same
+    direction and by more than ``threshold``. Neighbors further than
+    ``max_gap_s`` away cannot show that a reading is corrupt and are not used.
+    With ``require_agreement`` the two neighbors must also agree with each
+    other to within half the threshold, so a reading in a steady rise or fall
+    is never flagged.
+
+    Parameters
+    ----------
+    seconds : numpy.ndarray
+        Integer report times (s) of the valid readings, ascending.
+    values : numpy.ndarray
+        The valid readings, aligned with ``seconds``.
+
+    Returns
+    -------
+    numpy.ndarray of bool
+        True where a reading is flagged. First and last readings are never
+        flagged.
+    """
+    flagged = np.zeros(values.size, dtype=bool)
+    if values.size < 3:
+        return flagged
+    left = values[1:-1] - values[:-2]
+    right = values[1:-1] - values[2:]
+    close = ((seconds[1:-1] - seconds[:-2] <= max_gap_s)
+             & (seconds[2:] - seconds[1:-1] <= max_gap_s))
+    spike = close & (((left > threshold) & (right > threshold))
+                     | ((left < -threshold) & (right < -threshold)))
+    if require_agreement:
+        spike &= np.abs(values[2:] - values[:-2]) < threshold / 2
+    flagged[1:-1] = spike
+    return flagged
+
+
+def screen_single_readings(times, values, threshold, valid_range):
+    """
+    Set to NaN any reading outside ``valid_range`` and any lone reading that
+    ``single_reading_spikes`` flags, for an instrument whose telegrams are
+    occasionally corrupted in transmission.
+    """
+    values = np.asarray(values, dtype=float).copy()
+    lo, hi = valid_range
+    with np.errstate(invalid='ignore'):
+        values[(values < lo) | (values > hi)] = np.nan
+    valid = np.flatnonzero(np.isfinite(values))
+    if valid.size >= 3:
+        seconds = np.asarray(times[valid], dtype='datetime64[s]').astype('int64')
+        spike = single_reading_spikes(seconds, values[valid], threshold,
+                                      SURFACE_SPIKE_MAX_GAP_S, require_agreement=True)
+        values[valid[spike]] = np.nan
+    return values
+
+
+def rain_counter_increments(times, counter):
+    """
+    Rain per report from a cumulative rain counter, aligned to ``times``.
+
+    The counter only rises while rain falls, so the rain in each report
+    interval is the rise in the counter since the previous report. Three
+    departures from that are handled:
+
+    - A single reading differing from both neighbors in the same direction
+      by more than ``RAIN_COUNTER_SPIKE_MM`` is a corrupted telegram and is
+      skipped.
+    - A drop to below ``RAIN_COUNTER_SPIKE_MM`` is a counter restart; the new
+      reading is the rain since the restart.
+    - Any other drop is noise. The level is the running maximum since the
+      last restart, so a dip and the recovery after it add no rain.
+
+    Rises across a gap longer than ``RAIN_COUNTER_MAX_GAP_S`` are not placed,
+    because rain that fell during an outage cannot be located in time. The
+    first report of a file has no predecessor and carries no amount.
+
+    Parameters
+    ----------
+    times : pandas.DatetimeIndex
+        Report times.
+    counter : numpy.ndarray
+        Counter values (mm); missing reports are NaN or beyond the ±9999
+        sentinel.
+
+    Returns
+    -------
+    numpy.ndarray
+        Rain (mm) at each report time, NaN where no amount can be assigned.
+    """
+    counter = np.asarray(counter, dtype=float).copy()
+    counter[np.abs(counter) > 9999] = np.nan
+    out = np.full(counter.shape, np.nan)
+    valid = np.flatnonzero(np.isfinite(counter))
+    if valid.size < 2:
+        return out
+    values = counter[valid]
+    seconds = np.asarray(times[valid], dtype='datetime64[s]').astype('int64')
+    if values.size >= 3:
+        keep = ~single_reading_spikes(seconds, values, RAIN_COUNTER_SPIKE_MM,
+                                      RAIN_COUNTER_MAX_GAP_S)
+        valid, values, seconds = valid[keep], values[keep], seconds[keep]
+        if valid.size < 2:
+            return out
+    level = values[0]
+    for k in range(1, values.size):
+        if values[k] < RAIN_COUNTER_SPIKE_MM and values[k] < level - RAIN_COUNTER_SPIKE_MM:
+            amount, level = values[k], values[k]
+        else:
+            amount = max(values[k] - level, 0.0)
+            level = max(level, values[k])
+        if seconds[k] - seconds[k - 1] <= RAIN_COUNTER_MAX_GAP_S:
+            out[valid[k]] = amount
+    return out
+
+
 def get_surface_met_files_for_date(date_str, location, data_dir):
     """Get all surface met files for a date, handling different file structures"""
     date_obj = pd.to_datetime(date_str)
@@ -707,7 +796,7 @@ def get_surface_met_files_for_date(date_str, location, data_dir):
         # Rhode Island: hourly files
         pattern = f"rhod.met.z01.a0.{date_formatted}.*.nc"
         files = glob.glob(os.path.join(data_dir, '**', pattern), recursive=True)
-        return sorted(files)  # Return all hourly files for the day
+        return sorted(files)
     else:
         # Other sites: single daily file
         patterns = get_surface_met_patterns(location)
@@ -715,7 +804,7 @@ def get_surface_met_files_for_date(date_str, location, data_dir):
             formatted_pattern = pattern.format(date_formatted=date_formatted)
             matches = glob.glob(os.path.join(data_dir, '**', formatted_pattern), recursive=True)
             if matches:
-                return [matches[0]]  # Return single file
+                return [matches[0]]
     return []
 
 def process_surface_met_for_date(date_str, data_dir=None, start_time=None, end_time=None,
@@ -748,13 +837,10 @@ def process_surface_met_for_date(date_str, data_dir=None, start_time=None, end_t
                          'relative_humidity': val, 'precipitation': val}}
     """
     
-    # Find file paths
     file_paths = []
     if file_path:
-        # Single file provided
         file_paths = [file_path]
     else:
-        # Search for files
         if not data_dir:
             return {}
         file_paths = get_surface_met_files_for_date(date_str, location, data_dir)
@@ -766,12 +852,11 @@ def process_surface_met_for_date(date_str, data_dir=None, start_time=None, end_t
     
     if verbose:
         print(f"Found {len(file_paths)} surface met files for {date_str}")
-        for fp in file_paths[:3]:  # Show first 3 files
+        for fp in file_paths[:3]:
             print(f"  {os.path.basename(fp)}")
         if len(file_paths) > 3:
             print(f"  ... and {len(file_paths)-3} more")
     
-    # Process all files and combine data
     all_data = []
     
     for file_path in file_paths:
@@ -784,14 +869,12 @@ def process_surface_met_for_date(date_str, data_dir=None, start_time=None, end_t
             ds = xr.open_dataset(file_path)
             time_data = pd.to_datetime(ds.time.values)
             
-            # Variable extraction and cleaning
             var_map = {
                 'pressure': ['air_pressure', 'barometric_pressure', 'pressure', 'pres', 'atmos_pressure'],
                 'temperature': ['ambient_air_temperature', 'air_temperature', 'temperature', 'temp'],
                 'relative_humidity': ['relative_humidity', 'rh', 'humidity'],
             }
 
-            # Add precipitation for sites that have it
             if location not in ['rhode_island', 'rhod']:
                 var_map['precipitation'] = ['precipitation', 'precip', 'rainfall']
 
@@ -814,11 +897,20 @@ def process_surface_met_for_date(date_str, data_dir=None, start_time=None, end_t
                         break
                 variables[var] = data if data is not None else np.full(len(time_data), np.nan)
 
-            # Always ensure precipitation exists in the result (as NaN for sites without it)
             if 'precipitation' not in variables:
                 variables['precipitation'] = np.full(len(time_data), np.nan)
+
+            # The Cape Cod WXT536 reports rain as a running counter, not an amount.
+            if location in ('cape_cod', 'caco') and 'rain_accumulation' in ds.variables:
+                variables['precipitation'] = rain_counter_increments(
+                    time_data, ds['rain_accumulation'].values)
+
+            # The same corrupted telegrams reach pressure, temperature and
+            # humidity, where a single bad reading would bias a 10-minute mean.
+            if location in ('cape_cod', 'caco'):
+                for var, (limits, jump) in CACO_WXT_SCREEN.items():
+                    variables[var] = screen_single_readings(time_data, variables[var], jump, limits)
             
-            # Create DataFrame for this file
             file_df = pd.DataFrame(variables, index=time_data)
             all_data.append(file_df)
             
@@ -834,16 +926,13 @@ def process_surface_met_for_date(date_str, data_dir=None, start_time=None, end_t
             print(f"No valid data found in any files for {date_str}")
         return {}
     
-    # Combine all DataFrames
     df = pd.concat(all_data, ignore_index=False).sort_index()
     
-    # Remove duplicates (keep first occurrence)
     df = df[~df.index.duplicated(keep='first')]
     
     if verbose:
         print(f"Combined data: {len(df)} time points from {df.index.min()} to {df.index.max()}")
     
-    # Generate time windows for the full day
     date_obj = pd.to_datetime(date_str)
     # Left-closed window edges for the day; [:-1] drops the next day's 00:00
     # so each window is labeled by its start time and days don't double-count.
@@ -853,10 +942,10 @@ def process_surface_met_for_date(date_str, data_dir=None, start_time=None, end_t
         freq=f'{TIME_WINDOW_MINUTES}min'
     )[:-1]
     
-    # Pre-compute unix timestamps
-    unix_times = time_windows.astype('int64') // 10**9
+    # The integer backing a datetime64 is in the index's own resolution, which
+    # is not guaranteed to be nanoseconds, so convert through the dtype.
+    unix_times = time_windows.astype('datetime64[s]').astype('int64')
     
-    # Process each 10-minute window
     result = {}
     valid_windows = 0
     
@@ -866,37 +955,48 @@ def process_surface_met_for_date(date_str, data_dir=None, start_time=None, end_t
         window_data = df[window_mask]
         
         if len(window_data) > 0:
-            # Guard each aggregator with a dropna() length check so an all-NaN
-            # window returns NaN instead of np.nansum's silent 0.0 (which would
-            # be indistinguishable from a genuine dry interval for precipitation).
+            # An all-NaN window must yield NaN: np.nansum would return 0.0, which
+            # for precipitation is indistinguishable from a genuinely dry interval.
             window_result = {
                 'pressure': float(np.nanmean(window_data['pressure'])) if len(window_data['pressure'].dropna()) > 0 else np.nan,
                 'temperature': float(np.nanmean(window_data['temperature'])) if len(window_data['temperature'].dropna()) > 0 else np.nan,
                 'relative_humidity': float(np.nanmean(window_data['relative_humidity'])) if len(window_data['relative_humidity'].dropna()) > 0 else np.nan,
                 'precipitation': float(np.nansum(window_data['precipitation'])) if len(window_data['precipitation'].dropna()) > 0 else np.nan
             }
+
+            # Until 12 May 2024 the Cape Cod WXT536 sent its rain telegram only
+            # while rain was falling, so a window with no rain report is dry if
+            # the station was otherwise reporting, and missing if it was silent.
+            if (location in ('cape_cod', 'caco') and np.isnan(window_result['precipitation'])
+                    and any(np.isfinite(window_result[k])
+                            for k in ('pressure', 'temperature', 'relative_humidity'))):
+                window_result['precipitation'] = 0.0
             
-            # Add wind data for Block Island
             if location == 'block_island' and len(window_data) > 0:
                 if 'wind_speed' in window_data.columns and 'wind_direction' in window_data.columns:
                     ws_mean = float(np.nanmean(window_data['wind_speed']))
                     wd_values = window_data['wind_direction'].dropna().values
                     wd_mean = float(wind_direction_average(wd_values)) if len(wd_values) > 0 else np.nan
-                    
+
                     if not (np.isnan(ws_mean) or np.isnan(wd_mean)):
+                        # Keyed by the configured measurement height (10 m
+                        # surface-met tower per NOAA PSL spec,
+                        # https://psl.noaa.gov/data/obs/instruments/SurfaceMetDescription.html);
+                        # downstream uses this key as the true AGL height.
+                        surf_wind_height = float(LOCATION_CONFIG.get(location, {})
+                                                 .get('anemometer_heights', {})
+                                                 .get('surf_met', 10.0))
                         window_result['wind_profile'] = {
-                            10.0: {  # 10m AGL measurement height
+                            surf_wind_height: {
                                 'ws': round(ws_mean, 2),
                                 'wd': round(wd_mean, 1),
                             }
                         }
             
-            # Count as valid if we have at least one non-NaN value
             if not all(np.isnan(v) for v in window_result.values() if isinstance(v, (int, float))):
                 valid_windows += 1
                 
         else:
-            # No data for this window
             window_result = {
                 'pressure': np.nan, 
                 'temperature': np.nan,

@@ -1,23 +1,14 @@
-"""Run the pipeline! --> Process a site for a date range and produce 
-merged wind profiles, NetCDF files, and diagnostic plots.
+"""Process a site over a date range into merged wind profiles, NetCDF
+files, and diagnostic plots.
 
 Public entry points (called by users and by ``process_parallel.py``):
 
-  - ``process_wind_profiles(start_date, end_date, location)``: process a
-    site over a date range; calls ``process_wind_profiles_for_date`` per
-    day and writes one NetCDF per processed day.
+  - ``process_wind_profiles(start_date, end_date, location)``: a date
+    range, one NetCDF per processed day.
   - ``process_wind_profiles_for_date(date, ...)``: single-day processing.
   - ``process_full_day_with_hovmoller``: same plus diagnostic Hovmöller
     plots.
   - ``create_monthly_hovmoller_plots``: campaign-summary plotting.
-
-Each call ties together:
-
-  1. File discovery (``discovery_and_export``)
-  2. Per-instrument processing (``lidars``, ``radars``, ``anemometers``)
-  3. Hierarchical merging (``merging``)
-  4. NetCDF export (``discovery_and_export``)
-  5. Optional diagnostic plotting (``plotting``)
 
 Site- and instrument-specific behavior is read from ``config.py``; this
 module contains no site logic itself.
@@ -49,7 +40,6 @@ def process_and_plot_combined_profiles(instrument_configs, start_time, end_time,
 
     Returns (combined_results, saved_plot_files).
     """
-    # Process combined profiles
     combined_results = process_combined_profiles(
         instrument_configs, start_time, end_time, location=location,
         availability_threshold=availability_threshold,
@@ -62,7 +52,21 @@ def process_and_plot_combined_profiles(instrument_configs, start_time, end_time,
         print("No combined data to plot")
         return combined_results, []
 
-    # Create wind profile plots
+    plots = _create_plots_for_results(
+        combined_results, instrument_configs, start_time, end_time,
+        location=location, output_dir=output_dir,
+        availability_threshold=availability_threshold,
+        max_plots=max_plots, show_availability=show_availability,
+        verbose=verbose)
+
+    return combined_results, plots
+
+
+def _create_plots_for_results(combined_results, instrument_configs, start_time, end_time,
+                              location, output_dir, availability_threshold,
+                              max_plots, show_availability, verbose):
+    """Per-interval wind profile plots plus the optional daily surface-met
+    plot. Kept separate from the merge so callers can save the NetCDF first."""
     wind_plots = plot_combined_profiles(
         combined_results, output_dir,
         max_plots=max_plots,
@@ -71,13 +75,11 @@ def process_and_plot_combined_profiles(instrument_configs, start_time, end_time,
     )
     plots = wind_plots
 
-    # Create full daily surface met plot if surface_met instrument was found
     if 'surface_met' in instrument_configs:
         try:
             if verbose:
                 print("\nCreating full daily surface met plot...")
 
-            # Extract date and base directory
             if isinstance(start_time, str):
                 start_dt = pd.to_datetime(start_time)
             else:
@@ -89,11 +91,9 @@ def process_and_plot_combined_profiles(instrument_configs, start_time, end_time,
 
             date_str = start_dt.strftime('%Y-%m-%d')
 
-            # Get base directory from surface_met config
             surface_met_file = instrument_configs['surface_met']['filename']
             base_dir = str(Path(surface_met_file).parent.parent)
 
-            # Create full daily plot with analysis window highlighted
             surface_plot = create_full_daily_surface_met_plot(
                 date_str=date_str,
                 base_dir=base_dir,
@@ -121,7 +121,7 @@ def process_and_plot_combined_profiles(instrument_configs, start_time, end_time,
         if verbose:
             print("No surface_met instrument found - skipping surface met plot")
 
-    return combined_results, plots
+    return plots
 
 def process_wind_profiles_for_date(date, base_dir, start_time=None, end_time=None,
                              location='nantucket',
@@ -131,34 +131,31 @@ def process_wind_profiles_for_date(date, base_dir, start_time=None, end_time=Non
                              force_reprocess=False,
                              verbose=False, **kwargs):
     """
-    Complete wind and turbulence profile processing for a specific date
+    Complete wind and turbulence profile processing for a specific date.
 
     Parameters:
     -----------
     date : str or datetime
-        Target date (e.g., '2024-07-03' or datetime object)
+        Target date (e.g., '2024-07-03').
     base_dir : str
-        Root directory to search for instrument files
-    start_time : str or datetime, optional
-        Start time (default: beginning of date)
-        Format: 'YYYY-MM-DD HH:MM:SS' or 'HH:MM:SS'
-    end_time : str or datetime, optional
-        End time (default: end of date)
-        Format: 'YYYY-MM-DD HH:MM:SS' or 'HH:MM:SS'
+        Root directory to search for instrument files.
+    start_time, end_time : str or datetime, optional
+        Analysis window, 'YYYY-MM-DD HH:MM:SS' or 'HH:MM:SS'.
+        Default: the whole date, 00:00:00 to 23:59:00.
     location : str, optional
-        Location name ('nantucket', 'block island', etc.)
+        Location name ('nantucket', 'block island', etc.).
     output_dir : str, optional
-        Output directory for plots (default: './wind_profiles_{date}')
+        Output directory for plots (default: './wind_profiles_{date}').
     availability_threshold : float, optional
-        Minimum fraction of valid data required per interval (0-1)
+        Minimum fraction of valid data required per interval (0-1).
     show_availability : bool, optional
-        Include availability panel in plots (default: False)
+        Include availability panel in plots (default: False).
     max_plots : int, optional
-        Maximum number of plots to generate (default: all)
+        Maximum number of plots to generate (default: all).
     verbose : bool, optional
-        Print detailed processing information (default: False)
+        Print detailed processing information (default: False).
     **kwargs
-        Additional parameters passed to processing functions
+        Additional parameters passed to processing functions.
 
     Returns:
     --------
@@ -166,24 +163,12 @@ def process_wind_profiles_for_date(date, base_dir, start_time=None, end_time=Non
         {
             'results': combined_results_dict,
             'plots': list_of_saved_plot_files,
+            'hovmoller_plot': path_to_hovmoller_png or None,
+            'netcdf_file': path_to_saved_product or None,
             'instruments_found': list_of_instrument_names,
             'processing_summary': summary_stats
         }
-
-    Examples:
-    ---------
-    # Process full day
-    output = process_wind_profiles_for_date('2024-07-03', '/path/to/data')
-
-    # Process specific time window
-    output = process_wind_profiles_for_date(
-        '2024-07-03', '/path/to/data',
-        start_time='05:00:00', end_time='05:10:00',
-        location='block island',
-        availability_threshold=0.5, show_availability=True
-    )
     """
-    # Convert date to datetime object
     if isinstance(date, str):
         date_obj = pd.to_datetime(date).date()
         date_str = date_obj.strftime('%Y-%m-%d')
@@ -191,7 +176,7 @@ def process_wind_profiles_for_date(date, base_dir, start_time=None, end_time=Non
         date_obj = date.date() if hasattr(date, 'date') else date
         date_str = date_obj.strftime('%Y-%m-%d')
 
-    # Handle start/end times
+    # A bare 'HH:MM:SS' is qualified with the target date.
     if start_time is None:
         start_time = f"{date_str} 00:00:00"
     elif isinstance(start_time, str) and ':' in start_time and len(start_time) <= 8:
@@ -202,11 +187,9 @@ def process_wind_profiles_for_date(date, base_dir, start_time=None, end_time=Non
     elif isinstance(end_time, str) and ':' in end_time and len(end_time) <= 8:
         end_time = f"{date_str} {end_time}"
 
-    # Normalize location for consistent handling
     location = normalize_location(location)
     site_code = SITE_CODES.get(location, location[:4])
 
-    # Set default output directory
     if output_dir is None:
         year = pd.to_datetime(date_str).year
         month = pd.to_datetime(date_str).month
@@ -220,7 +203,6 @@ def process_wind_profiles_for_date(date, base_dir, start_time=None, end_time=Non
         print(f"Searching for files in: {base_dir}")
         print(f"Output directory: {output_dir}")
 
-    # Initialize default summary structure
     default_summary = {
         'date_processed': date_str,
         'location': location,
@@ -238,10 +220,8 @@ def process_wind_profiles_for_date(date, base_dir, start_time=None, end_time=Non
         'error': None
     }
 
-    # Auto-discover instrument files
     try:
         configs = discover_instrument_files_for_date_range(date_obj, date_obj, location=location)
-        # Extract configs for the specific date
         date_str = date_obj.strftime('%Y-%m-%d')
         if date_str in configs:
             configs = configs[date_str]
@@ -282,38 +262,36 @@ def process_wind_profiles_for_date(date, base_dir, start_time=None, end_time=Non
             'processing_summary': summary
         }
 
-    # Process and plot
+    # Merge, save, then plot, in that order: the NetCDF is the product, so
+    # it must be on disk before anything that can fail cosmetically runs.
     try:
-        results, plots = process_and_plot_combined_profiles(
+        results = process_combined_profiles(
             configs,
             start_time=start_time,
             end_time=end_time,
             location=location,
-            output_dir=output_dir,
             availability_threshold=availability_threshold,
-            show_availability=show_availability,
-            max_plots=max_plots,
+            include_availability=show_availability,
             verbose=verbose,
             **kwargs
         )
 
-        # Initialize additional outputs
         hovmoller_plot = None
         netcdf_file = None
+        save_error = None
+        plots = []
 
-        # Save NetCDF file if requested and we have results
         if save_netcdf and results and results.get('time_intervals'):
             try:
                 if verbose:
                     print(f"\nSaving NetCDF file...")
 
-                # Construct NetCDF filename with location code
+                # Filename stamps the requested date at 000000, never the first
+                # data interval, so a partial day cannot mint a second name.
                 date_formatted = date_str.replace('-', '')
-
-                netcdf_filename = f"wind_profiles_{date_formatted}_{site_code}.nc"
+                netcdf_filename = f"{site_code}.windprof.z01.c1.{date_formatted}.000000.nc"
                 netcdf_path = os.path.join(output_dir, netcdf_filename)
 
-                # Save to NetCDF
                 saved_path = save_results_to_netcdf(results, netcdf_path, location=location, verbose=verbose)
                 if saved_path:
                     netcdf_file = saved_path
@@ -321,15 +299,30 @@ def process_wind_profiles_for_date(date, base_dir, start_time=None, end_time=Non
                     if verbose:
                         print(f"✓ NetCDF saved: {netcdf_filename}")
                 else:
-                    if verbose:
-                        print("✗ NetCDF save failed")
+                    save_error = 'save_results_to_netcdf returned no path'
+                    print("✗ NetCDF save failed")
             except Exception as e:
+                save_error = str(e)
                 print(f"Failed to save NetCDF: {e}")
                 if verbose:
                     import traceback
                     traceback.print_exc()
 
-        # Create Hovmöller plot if requested and we have results
+        # Plotting is best-effort once the product is on disk.
+        if results and results.get('time_intervals'):
+            try:
+                plots = _create_plots_for_results(
+                    results, configs, start_time, end_time,
+                    location=location, output_dir=output_dir,
+                    availability_threshold=availability_threshold,
+                    max_plots=max_plots, show_availability=show_availability,
+                    verbose=verbose)
+            except Exception as e:
+                print(f"Plotting failed (product already saved): {e}")
+                if verbose:
+                    import traceback
+                    traceback.print_exc()
+
         if create_hovmoller and results and results.get('time_intervals'):
             try:
                 if verbose:
@@ -352,18 +345,15 @@ def process_wind_profiles_for_date(date, base_dir, start_time=None, end_time=Non
                     import traceback
                     traceback.print_exc()
 
-        # Count surface met windows (from time intervals)
         surface_met_count = 0
         if results and results.get('time_intervals'):
             surface_met_count = sum(1 for interval in results.get('time_intervals', [])
                                    if 'surface_met' in interval and
                                    not all(np.isnan(list(interval['surface_met'].values()))))
 
-        # Identify plot types
         surface_met_plots = [p for p in plots if 'surface_met' in os.path.basename(p)]
         wind_plots = [p for p in plots if 'surface_met' not in os.path.basename(p)]
 
-        # Create successful summary
         summary = default_summary.copy()
         summary.update({
             'instruments_found': len(configs),
@@ -374,6 +364,12 @@ def process_wind_profiles_for_date(date, base_dir, start_time=None, end_time=Non
             'plots_created': len(plots),
             'status': 'success'
         })
+
+        # "Success" means the product exists on disk: a requested save that
+        # produced no file fails the day however the merge went.
+        if save_netcdf and results and results.get('time_intervals') and netcdf_file is None:
+            summary['status'] = 'failed'
+            summary['error'] = f'NetCDF save failed: {save_error}'
 
         if verbose:
             print(f"\nProcessing complete!")
@@ -435,7 +431,6 @@ def process_wind_profiles(start_date, end_date, location='nantucket',
     """
     import gc
 
-    # Convert to datetime objects
     if isinstance(start_date, str):
         start_obj = pd.to_datetime(start_date)
     else:
@@ -445,23 +440,19 @@ def process_wind_profiles(start_date, end_date, location='nantucket',
     else:
         end_obj = end_date
 
-    # Determine year/month for paths (use start date)
+    # Default input and output paths use the START month of the range.
     year = start_obj.year
     month = start_obj.month
     yyyymm = f"{year}{month:02d}"
 
-    # Normalize location
     location = normalize_location(location)
     loc_code = SITE_CODES.get(location, location[:4])
 
-    # Set default base_dir if not provided
     if base_dir is None:
         base_dir = f"{DATA_BASE_PATH}{yyyymm}"
 
-    # Generate date range
     date_range = pd.date_range(start=start_obj, end=end_obj, freq='D')
 
-    # Set default output directory based on location and date
     if output_dir is None:
         output_dir = os.path.join(RESULTS_BASE_PATH, loc_code, yyyymm)
 
@@ -478,12 +469,10 @@ def process_wind_profiles(start_date, end_date, location='nantucket',
         print(f"Processing {date_str} - {location} ({successful_days + failed_days + 1}/{len(date_range)})")
         print(f"{'='*50}")
 
-        # Create date-specific output directory
         date_formatted = date_str.replace('-', '')
         date_output_dir = os.path.join(output_dir, f"{date_formatted}")
 
         try:
-            # Process single day (saves NetCDF automatically)
             day_result = process_wind_profiles_for_date(
                 date_str,
                 base_dir=base_dir,
@@ -501,7 +490,8 @@ def process_wind_profiles(start_date, end_date, location='nantucket',
                 **kwargs
             )
 
-            if day_result and day_result.get('results'):
+            day_status = (day_result or {}).get('processing_summary', {}).get('status')
+            if day_result and day_result.get('results') and day_status == 'success':
                 successful_days += 1
                 if verbose:
                     print(f"✓ {date_str} processed successfully")
@@ -513,7 +503,6 @@ def process_wind_profiles(start_date, end_date, location='nantucket',
                 failed_days += 1
                 print(f"✗ {date_str} failed - no results generated")
 
-            # Clear memory
             del day_result
             gc.collect()
 
@@ -540,18 +529,15 @@ def process_full_day_with_hovmoller(date, base_dir, output_dir=None,
     per-interval profile plots (max_plots=0) and exposes the Hovmöller path
     directly in the return dict.
     """
-    # Convert date for directory naming
     if isinstance(date, str):
         date_obj = pd.to_datetime(date)
     else:
         date_obj = date
     date_str = date_obj.strftime('%Y%m%d')
 
-    # Set default output directory
     if output_dir is None:
         output_dir = f"./wind_profiles_{date_str}"
 
-    # Process full day
     output = process_wind_profiles_for_date(
         date=date,
         base_dir=base_dir,
@@ -568,7 +554,6 @@ def process_full_day_with_hovmoller(date, base_dir, output_dir=None,
 
     hovmoller_plot = None
     if create_hovmoller and output['results']:
-        # Create Hovmöller plot
         try:
             if verbose:
                 print(f"\nCreating Hovmöller plot...")
@@ -597,14 +582,12 @@ def create_monthly_hovmoller_plots(start_date, end_date, output_dir=None, locati
     Runs the full pipeline per day but suppresses per-interval profile plots.
     Returns {date_str: path_to_hovmoller_png}.
     """
-    # Get all configs for the date range
     all_configs = discover_instrument_files_for_date_range(start_date, end_date, location=location)
 
     if not all_configs:
         print("No files found for the specified date range.")
         return {}
 
-    # Set default output directory
     if output_dir is None:
         start_str = pd.to_datetime(start_date).strftime('%Y%m%d')
         end_str = pd.to_datetime(end_date).strftime('%Y%m%d')
@@ -616,7 +599,6 @@ def create_monthly_hovmoller_plots(start_date, end_date, output_dir=None, locati
     for date_str, day_configs in all_configs.items():
         print(f"Creating Hovmöller plot for {date_str}...")
 
-        # Process full day for this date
         try:
             results, _ = process_and_plot_combined_profiles(
                 day_configs,
@@ -629,7 +611,6 @@ def create_monthly_hovmoller_plots(start_date, end_date, output_dir=None, locati
             )
 
             if results and results.get('time_intervals'):
-                # Create Hovmöller plot
                 date_formatted = date_str.replace('-', '')
                 hovmoller_plot = create_daily_hovmoller_plots(
                     results, output_dir, date_formatted,

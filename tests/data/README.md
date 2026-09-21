@@ -4,7 +4,7 @@ This directory is empty by default. To enable the integration smoke test in
 `tests/test_smoke.py`, populate it with one day of public WFIP3 input files
 from the DOE Wind Data Hub.
 
-The reference test date is **2024-09-15 at Block Island** — chosen because
+The reference test date is **2024-09-15 at Block Island**, chosen because
 BLOC has the smallest instrument inventory (one scanning lidar, one
 profiling lidar, one radar, surface met) and was verified to produce a
 clean merged output during refactor validation.
@@ -58,6 +58,30 @@ file, so the test stays robust under harmless code reorganization.
 
 If `tests/data/data/` is empty, the integration test is automatically
 skipped and only the import-only smoke tests run.
+
+## Cape Cod vendor workbook (a separate test)
+
+`tests/test_caco_vendor_ti.py` needs one WindCube V2-96 vendor workbook:
+
+```
+caco.lidar.z01.00.20240516.000000.xlsx
+```
+
+Download it from the `caco.lidar.z01.00` datastream at
+`https://wdh.energy.gov/ds/wfip3/caco.lidar.z01.00` and place it in either:
+
+```
+tests/data/caco.lidar.z01.00.20240516.000000.xlsx
+caco_z01_lidar_sample/caco.lidar.z01.00.20240516.000000.xlsx
+```
+
+The test checks both locations. Roughly 500 KB.
+
+Without it, two of the nine tests skip; the other seven use synthetic data and always run. Those two
+pin the ingest of the workbook's `Wind Speed Dispersion` column, which is the scan-to-scan
+sigma(WS) and the only turbulence quantity taken from this delivery. The workbook's separate
+`Z-wind Dispersion` is the vertical beam's radial-velocity standard deviation, not the VAD-fit
+sigma_w the pipeline reports, and is deliberately not read.
 
 ## Why this isn't shipped with the repo
 

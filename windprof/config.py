@@ -1,13 +1,12 @@
-"""Site, instrument, and processing configuration for WINDPROF best-estimate pipeline
+"""Site, instrument, and processing configuration for the WINDPROF pipeline.
 
-Single source of truth for the parameters a user adapting WINDPROF for a
-new campaign would need to edit:
+Single source of truth for everything site specific:
 
-  - ``LOCATION_CONFIG``: per-site instrument coordinates, ground
-    elevations, azimuth corrections (true-north reference), vertical
-    velocity sign corrections, anemometer corrections and tower heights.
-  - ``LOCATION_ALIASES`` / ``SITE_CODES``: canonical site naming and
-    short codes used in output filenames.
+  - ``LOCATION_CONFIG``: per-site instrument coordinates, ground elevations,
+    azimuth and vertical-velocity sign corrections, anemometer corrections
+    and measurement heights.
+  - ``LOCATION_ALIASES`` / ``SITE_CODES``: canonical site names and the short
+    codes used in output filenames.
   - ``MALFUNCTION_PERIODS``: time ranges to exclude per instrument.
   - Per-instrument QC variable names and lookup helpers
     (``get_wind_correction``, ``get_w_sign_correction``, etc.).
@@ -15,14 +14,6 @@ new campaign would need to edit:
 Paths default to ``./data`` and ``./results`` relative to the current
 working directory; override with the ``WINDPROF_DATA_PATH`` and
 ``WINDPROF_RESULTS_PATH`` environment variables.
-
-All site-specific knowledge is intended to live in this file. Processing
-modules read from ``config.py`` rather than embedding site assumptions,
-so adapting WINDPROF for a similar campaign should mostly be a matter of
-adding a ``LOCATION_CONFIG`` entry, plus any format-specific reader
-hooks where the new campaign's instruments differ in file format from
-those encountered in WFIP3 (see ``lidar_parsers.py``,
-``anemometers.py`` and ``radars.py``).
 """
 
 import os
@@ -32,18 +23,15 @@ import numpy as np
 import pandas as pd
 
 ### Processing Parameters
-TIME_WINDOW_MINUTES = 10  # minutes; can modify to adjust output time resolution
+TIME_WINDOW_MINUTES = 10  # output time resolution
 
 ### Terrain and Coordinates
 
-#### Location Configuration
 LOCATION_CONFIG = {
     'nantucket': {
-        # Average coords across active instruments is 41.243195125, -70.105867125. 
-        # z03_met (10 m north-facing sonic) and z04_met (same) are retained here 
-        # as documentation but NOT used in processing - the tower creates >20% 
-        # wind-speed error under the dominant SW flow, so only the SW-facing z02 
-        # 5 m sonic is kept. z03_met is also excluded due to sparse data coverage.
+        # z03_met and z04_met (10 m, north facing) are documented but not
+        # processed: the tower wakes them under the dominant SW flow (>20% wind
+        # speed error), and z03_met is sparse. Only the SW facing z02 5 m is used.
         'coordinates': {
             'z01': [41.24255, -70.107003],
             'z02': [41.24255, -70.107003],
@@ -70,14 +58,18 @@ LOCATION_CONFIG = {
             # z01: -80.8° from homepoint calibration (Newsom 2024, comms tower bearing)
             # + -16.34° empirical correction (z03/radar coincident bias, campaign-mean).
             'z01': -97.14,            
-            'z02': -4,  # empirical match to z03 WindCube. Source: 3/28/25 WINDPROF Meeting.
+            'z02': -4,  # empirical: aligns z02 direction with the co-located z03 WindCube
             'z03': 0,
             'radar': 0
         },
         'anemometer_corrections': {
-            # Physical orientation corrections were already applied upstream
-            # in the ingest parsers.
-            'z02': 0,
+            # Rotation from the instrument frame to true north, applied to (u, v)
+            # before the direction is formed: a POSITIVE value here DECREASES the
+            # direction, while the sonic paths at the other sites add theirs to
+            # the direction and rotate the opposite way.
+            # z02: the declination was entered at the instrument with the wrong
+            # sign, so the residual is twice the declination.
+            'z02': 28,
             'z03': 0,
             'z04': 0
         },
@@ -95,7 +87,6 @@ LOCATION_CONFIG = {
         }
     },
     'block_island': {
-        # Average coords across active instruments is 41.16670025, -71.5803045. 
         'coordinates': { 
             'z01': [41.16663, -71.58033],
             'z03': [41.166835, -71.580446],
@@ -118,7 +109,7 @@ LOCATION_CONFIG = {
             'z01': 0
         },
         'anemometer_heights': { # Measurement heights AGL (m)
-            'z01': 10,         # sonic anemometer on met tower
+            'z01': 10,         # R.M. Young propeller-vane anemometer on the NOAA PSL met tower
             'surf_met': 10.0,  # same instrument, alternate key used by surface-met path
         },
         'w_sign_corrections': {
@@ -130,7 +121,6 @@ LOCATION_CONFIG = {
         }
     },
     'rhode_island': {
-        # Average coords across active instruments is 41.44811325, -71.432165.
         'coordinates': {
             'z01': [41.448043, -71.43225],
             'z03': [41.44809, -71.43233],  # from GPS in data file
@@ -147,10 +137,7 @@ LOCATION_CONFIG = {
         'wind_corrections': {
             'z01': 180,     
             'z02': 0.0,
-            # z03: empirically derived from z03-vs-radar bias-minimization
-            # at RHOD (the ZephIR-300 ships with magnetic-declination
-            # correction nominally applied at deployment, but the residual
-            # may support a small additional rotation correction).
+            # z03: empirical, from z03-vs-radar bias minimization.
             'z03': 15,
             'radar': 0.0
         },
@@ -186,7 +173,9 @@ LOCATION_CONFIG = {
         },        
         'wind_corrections': {
             'z01': 0.0,
-            'z02': 180,
+            # z02: 180 is a TO/FROM convention flip, not an azimuth offset; the
+            # remainder rotates magnetic to true north (westerly declination).
+            'z02': 165.5,
             'radar': 0.0
         },
         'anemometer_corrections': { 
@@ -231,16 +220,12 @@ def normalize_location(location):
     return LOCATION_ALIASES.get(loc, loc)
 
 ### Base Paths
-# Override via environment variables so the pipeline is portable across machines 
-# without editing config.py. Defaults point into the current working directory.
 
 DATA_BASE_PATH = os.environ.get('WINDPROF_DATA_PATH', str(Path.cwd() / 'data')) + '/'
 RESULTS_BASE_PATH = os.environ.get('WINDPROF_RESULTS_PATH', str(Path.cwd() / 'results')) + '/'
 
-# Available daily files (z03 profiling lidars, sonics, surface met) are read
-# directly from the campaign archive tree to avoid duplicating storage. On the
-# WFIP3 server this is /data; override via WINDPROF_ARCHIVE_PATH for other deployments. 
-# Local files had to be manually downloaded or merged to produce one daily file.
+# Campaign archive tree holding the daily input files (z03 profiling lidars,
+# sonics, surface met), read in place rather than copied.
 
 ARCHIVE_BASE_PATH = os.environ.get('WINDPROF_ARCHIVE_PATH', '/data')
 
@@ -282,7 +267,7 @@ SITE_INSTRUMENT_MAPPINGS = {
         'instruments': {
             'lidar_z01': 'rhod.lidar.z01.a0',
             'lidar_z03': 'rhod.lidar.z03.00',
-            'met_z01': 'rhod.sonic.z01.c0',
+            'met_z01': 'rhod.sonic.z01.c1',
             'surface_met': 'rhod.met.z01.a0'
         }
     },
@@ -301,63 +286,112 @@ SITE_INSTRUMENT_MAPPINGS = {
 # Instrument capability sets
 TURBULENCE_INSTRUMENTS = {'lidar_z01', 'lidar_z02', 'lidar_z03', 'met_z01', 'met_z02', 'met_z03', 'met_z04'}
 WIND_INSTRUMENTS = {'lidar_z01', 'lidar_z02', 'lidar_z03', 'radar', 'met_z01', 'met_z02', 'met_z03', 'met_z04'}
-VAD_INSTRUMENTS = {'lidar_z01', 'lidar_z02', 'lidar_z03'} # Types of instruments that can produce VAD profiles 
+VAD_INSTRUMENTS = {'lidar_z01', 'lidar_z02', 'lidar_z03'}
+
+# Per-instrument QC: the single source of truth for signal screening.
+# Thresholds are taken from each instrument's own raw-file headers where it
+# publishes one (WindCube CNRThreshold=; ZephIR packet and rain columns) and
+# from the scanning lidars' noise floor otherwise.
+#
+# qc_type:
+#   'intensity'    Halo scanning: keep beams with intensity >= threshold
+#                  (intensity = linear SNR + 1; 1.008 ~ the noise floor)
+#   'cnr'          WindCube profiling: keep gates with CNR(dB) >= threshold
+#   'samples_rain' ZephIR profiling: no CNR/SNR column, keep where
+#                  Packets >= min_samples AND rain% == 0
+#   'prefiltered'  QC already applied upstream by the instrument; no pipeline filter
+#
+# min_beams = 4: the wserr < 2 m/s gate needs dof >= 1, and a 3-beam VAD is
+# exactly determined (dof = 0), so sigma_ws is 0/0 and the gate cannot apply.
+QC_CONFIG = {
+    'nantucket': {
+        'z01': {'qc_type': 'intensity',    'threshold': 1.008, 'min_beams': 4},
+        'z02': {'qc_type': 'intensity',    'threshold': 1.008, 'min_beams': 4}, 
+        'z03': {'qc_type': 'cnr',          'threshold': -23},                    # header CNRThreshold=-23
+    },
+    'block_island': {
+        'z01': {'qc_type': 'intensity',    'threshold': 1.008, 'min_beams': 4},
+        'z03': {'qc_type': 'cnr',          'threshold': -22},                    # header CNRThreshold=-22
+    },
+    'rhode_island': {
+        'z01': {'qc_type': 'intensity',    'threshold': 1.008, 'min_beams': 4},
+        'z03': {'qc_type': 'samples_rain', 'min_samples': 20},                   # ZephIR pre-averaged; no SNR/CNR
+    },
+    'cape_cod': {
+        # min_ti_availability gates turbulence only, not wind: the workbook's
+        # speed dispersion is formed from whatever scans the vendor retained, so
+        # a window with almost none is not a turbulence measurement. 10% is the
+        # >= 3-valid-scan minimum of calculate_turbulence_metrics, as a fraction.
+        'z01': {'qc_type': 'prefiltered', 'min_ti_availability': 10},            # WindCube V2-96, filtered upstream
+        'z02': {'qc_type': 'intensity',    'threshold': 1.008, 'min_beams': 4},
+    },
+}
+
+# Default beam minimum for every least-squares wind fit (scanning VAD and the
+# RTD profiling fit); a QC_CONFIG entry overrides it per instrument.
+MIN_VAD_BEAMS = 4
+
+
+def get_qc_params(location, instrument):
+    """QC_CONFIG lookup that fails loudly on unknown (site, instrument)
+    pairs instead of silently defaulting: a typo here must not disable QC."""
+    location = normalize_location(location)
+    try:
+        return QC_CONFIG[location][instrument]
+    except KeyError:
+        raise ValueError(
+            f"No QC configuration for instrument '{instrument}' at "
+            f"'{location}'. Known: "
+            f"{ {loc: sorted(entries) for loc, entries in QC_CONFIG.items()} }")
 
 def get_instrument_coordinates(location, instrument_type):
     """Get coordinates for specific instrument at location"""
     config = LOCATION_CONFIG.get(location, {})
     coords = config.get('coordinates', {})
     
-    # Handle different naming conventions
     if instrument_type in coords:
         return coords[instrument_type]
     
-    # Strip lidar_ prefix if present
     if instrument_type.startswith('lidar_'):
-        stripped_name = instrument_type[6:]  # Remove 'lidar_'
+        stripped_name = instrument_type[6:]
         if stripped_name in coords:
             return coords[stripped_name]
     
-    # Try with _lidar suffix for lidar instruments
     if f"{instrument_type}_lidar" in coords:
         return coords[f"{instrument_type}_lidar"]
     
-    # Try with _met suffix for met instruments  
     if f"{instrument_type}_met" in coords:
         return coords[f"{instrument_type}_met"]
     
-    # Try stripping _lidar/_met suffix and looking for base name
     if instrument_type.endswith('_lidar'):
-        base_name = instrument_type[:-6]  # Remove '_lidar'
+        base_name = instrument_type[:-6]
         if base_name in coords:
             return coords[base_name]
     
     if instrument_type.endswith('_met'):
-        base_name = instrument_type[:-4]  # Remove '_met'
+        base_name = instrument_type[:-4]
         if base_name in coords:
             return coords[base_name]
         
     return None
-
+    
 def calculate_average_coordinates(location, instruments):
-    """Calculate average lat/lon weighted by instruments actually used in the data"""
+    """Unweighted mean lat/lon over instruments with configured coordinates,
+    with a per-site fallback"""
     coords_list = []
     
     for instrument in instruments:
         coords = get_instrument_coordinates(location, instrument)
         if coords and len(coords) == 2 and not any(np.isnan(coords)):
-            # Validate coordinates are reasonable (basic sanity check)
             lat, lon = coords
             if -90 <= lat <= 90 and -180 <= lon <= 180:
                 coords_list.append(coords)
     
     if coords_list:
-        # Weight all instruments equally (could be refined to weight by data availability)
         avg_lat = sum(coord[0] for coord in coords_list) / len(coords_list)
         avg_lon = sum(coord[1] for coord in coords_list) / len(coords_list)
         return avg_lat, avg_lon
     
-    # Fallback: Use site representative coordinates when instrument lookup fails
     site_defaults = {
         'cape_cod': [42.031888, -70.052386],    
         'block_island': [41.16670025, -71.5803045], 
@@ -375,10 +409,20 @@ def get_wind_correction(location, instrument):
     return corrections.get(instrument, 0)
 
 def get_anemometer_correction(location, instrument):
-    """Get anemometer coordinate correction for instrument at location"""
+    """Sonic frame-to-true-north rotation in degrees for instrument at location"""
     config = LOCATION_CONFIG.get(location, {})
     corrections = config.get('anemometer_corrections', {})
     return corrections.get(instrument, 0)
+
+def get_near_surface_levels():
+    """Grid levels for single-height anemometers: the configured measurement
+    heights across all sites (4/5/10 m in WFIP3), so each sonic sits at its own
+    height. 0 m carries no instrument and is deliberately not a grid level."""
+    levels = set()
+    for site in LOCATION_CONFIG.values():
+        for height in site.get('anemometer_heights', {}).values():
+            levels.add(float(height))
+    return tuple(sorted(levels))
 
 def get_w_sign_correction(instrument, location):
     """Get w sign correction factor from location config"""
@@ -439,7 +483,6 @@ def get_surface_met_patterns(location):
         }
     }
     
-    # Default to nantucket patterns if location not recognized
     return location_patterns.get(location, location_patterns['nantucket'])['patterns']
 
 def get_location_display_name(location):
@@ -470,41 +513,35 @@ def get_instrument_dataset_info(location):
     }
     return dataset_info.get(location.lower(), f'Instruments from {location}')
 
-#### Ground Elevation Functions 
-
 def get_ground_elevation_from_config(location, instrument):
-    """Get ground elevation from config values (faster than API calls)"""
+    """Ground elevation in m ASL for an instrument, or 0 if not configured"""
     elevations = LOCATION_CONFIG.get(location, {}).get('elevations', {})
     return elevations.get(instrument, 0)
 
-#### Utility Functions
-
 def round_profile_values(profile_data):
-    """
-    Round profile values based on parameter type
-    """
+    """Round profile values to the per-parameter precision in precision_map"""
     if not profile_data:
         return profile_data
     
     precision_map = {
-        'ws': 2, 'wd': 1, 'w': 2,  # Wind parameters
-        'ti': 3, 'tke': 3,          # Turbulence parameters  
-        'std_u': 3, 'std_v': 3, 'std_w': 3,  # Standard Deviations
-        'u': 2, 'v': 2,             # Wind components
-        'uerr': 3, 'verr': 3, 'werr': 3,  # Wind component errors
-        'wserr': 3, 'wderr': 3      # Wind speed/direction errors
+        'ws': 2, 'wd': 1, 'w': 2,
+        'ti': 3, 'tke': 3,
+        'std_u': 3, 'std_v': 3, 'std_w': 3,
+        'u': 2, 'v': 2,
+        'uerr': 3, 'verr': 3, 'werr': 3,
+        'wserr': 3, 'wderr': 3
     }
     
     rounded_data = {}
     for param, value in profile_data.items():
         if isinstance(value, (int, float)) and not (np.isnan(value) if isinstance(value, float) else False):
-            precision = precision_map.get(param, 2)  # Default to 2 decimals
-            if precision == 0:  # Integer values
+            precision = precision_map.get(param, 2)
+            if precision == 0:
                 rounded_data[param] = int(value)
             else:
                 rounded_data[param] = round(float(value), precision)
         else:
-            rounded_data[param] = value  # Keep NaN, None, etc. as-is
+            rounded_data[param] = value
     
     return rounded_data
 
