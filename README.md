@@ -4,7 +4,17 @@ Merged wind and turbulence profiles from multiple instruments, built for four co
 
 WINDPROF ingests scanning and profiling Doppler lidar, radar wind profiler, sonic anemometer, and surface meteorological data; applies instrument-specific quality control; retrieves winds from lidar radial velocities with velocity-azimuth display (VAD) fits; and merges the results into one height-resolved wind and turbulence profile every 10 minutes on a common vertical grid.
 
+![A merged 10-minute wind profile at Block Island, with each contributing instrument](docs/example_profile.png)
+
+*One merged profile at Block Island during a low-level jet, 13 February 2024, 08:10 UTC. Each instrument is shown at the heights where it reported, with the merged profile in gray; panel (b) enlarges the lowest 250 m. Below 1000 m the radar is shown for comparison and does not enter the merged value where a lidar reports. Shading in (b) is the scanning lidar's scan-to-scan wind speed variability over the window, not measurement uncertainty. Figure from the paper cited below.*
+
 > **Looking for the data?** The processed WFIP3 profiles are archived on the [DOE Wind Data Hub](https://wdh.energy.gov/ds/wfip3/): Nantucket [doi:10.21947/3014081](https://doi.org/10.21947/3014081), Block Island [doi:10.21947/3014087](https://doi.org/10.21947/3014087), Cape Cod [doi:10.21947/3014349](https://doi.org/10.21947/3014349), Rhode Island [doi:10.21947/3014814](https://doi.org/10.21947/3014814). You do not need this repository to use them. The code is for understanding the processing or adapting it to another multi-instrument campaign.
+
+## Example
+
+![A merged 10-minute wind profile at Block Island, with each contributing instrument](docs/example_profile.png)
+
+*One merged profile at Block Island during a low-level jet, 13 February 2024, 08:10 UTC. Each instrument is shown at the heights where it reported, with the merged profile in gray; panel (b) enlarges the lowest 250 m. Below 1000 m the radar is shown for comparison and does not enter the merged value where a lidar reports. Shading in (b) is the scanning lidar's scan-to-scan wind speed variability over the window, not measurement uncertainty. Figure from the paper cited below.*
 
 ## Scientific reference
 
